@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-pyo3 = { version = "0.28.2", features = ["extension-module"] }
-pyo3-stub-gen = "0.19.0"
+fancy-regex = "0.17.0"
+pyo3 = { version = "0.28.2", features = ["extension-module"], optional = true }
+pyo3-stub-gen = { version = "0.19.0", optional = true }
+rayon = "1.11.0"
+regex = "1.12.3"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+pyo3-extension = ["pyo3", "pyo3-stub-gen"]
