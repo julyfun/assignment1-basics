@@ -50,26 +50,31 @@ mod cs336_basics {
 
 mod core {
     use super::*;
-    use std::collections::{HashMap, BinaryHeap};
+    use std::collections::{BinaryHeap, HashMap, HashSet};
     use std::fs::File;
+    use std::io::ErrorKind::InvalidInput;
     use std::io::{BufReader, Error, Read, Seek, SeekFrom};
 
     // id => PreState
     /// merges the same pretokens
-    struct PreState {
-        bytes: Vec<u8>,
-        cnt: u64,
-        pre: Vec<i16>, // out of bounds means no pre/next
-        nxt: Vec<i16>,
-        vocab_id_at: Vec<u64>,
+    #[derive(Debug, Clone)]
+    pub struct PreState {
+        pub bytes: Vec<u8>,
+        pub cnt: u64,
+        pub pre: Vec<i16>, // out of bounds means no pre/next
+        pub nxt: Vec<i16>,
+        pub vocab_id_at: Vec<u64>,
     }
     impl PreState {
-        fn from(s: &[u8], vocab: &HashMap<Vec<u8>, u64>) -> Option<Self> {
+        pub fn from(s: &[u8], vocab: &HashMap<Vec<u8>, u64>) -> Option<Self> {
             let len = s.len() as i16;
             let pre = (0..len).map(|i| i - 1).collect();
             let nxt = (0..len).map(|i| i + 1).collect();
             // is Some() only if all in iter are Some()
-            let vocab_id_at = s.iter().map(|b| vocab.get([*b].as_slice()).copied()).collect::<Option<Vec<_>>>()?;
+            let vocab_id_at = s
+                .iter()
+                .map(|b| vocab.get([*b].as_slice()).copied())
+                .collect::<Option<Vec<_>>>()?;
             Some(Self {
                 bytes: s.to_vec(),
                 cnt: 1,
@@ -84,14 +89,19 @@ mod core {
 
     // (id, id) => ByteGroupState
     // 可能会 concat 两个 vocab_id 加入 vocab
-    #[derive(PartialOrd, PartialEq, Eq, Clone)]
-    struct ByteGroupState {
-        vocab_id_pair: (u64, u64),
-        cnt: u64,
-        pre_indices: Vec<(u64, i16)>,
+    #[derive(PartialEq, Eq, Clone)]
+    pub struct GroupPairState {
+        pub vocab_id_pair: (u64, u64),
+        pub cnt: u64,
+        pub pre_indices: HashSet<(u64, i16)>,
     }
     use std::cmp::Ordering;
-    impl Ord for ByteGroupState {
+    impl PartialOrd for GroupPairState {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for GroupPairState {
         fn cmp(&self, other: &Self) -> Ordering {
             if self.cnt < other.cnt {
                 Ordering::Less
@@ -103,9 +113,7 @@ mod core {
         }
     }
 
-    use std::io::ErrorKind::InvalidInput;
-
-    fn find_chunk_boundaries(
+    pub fn find_chunk_boundaries(
         file: &mut (impl Read + Seek),
         desired_num_chunks: usize,
         end_token: &[u8],
@@ -145,6 +153,16 @@ mod core {
         }
         Ok(boundaries)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::core::*;
+    use super::*;
+    use std::collections::{BinaryHeap, HashMap, HashSet};
+    use std::fs::File;
+    use std::io::ErrorKind::InvalidInput;
+    use std::io::{BufReader, Error, Read, Seek, SeekFrom};
 
     #[test]
     fn test_regex() -> Result<(), fancy_regex::Error> {
@@ -200,6 +218,14 @@ mod core {
         Ok(())
     }
 
+    fn invalid(s: String) -> std::io::Error {
+        std::io::Error::new(InvalidInput, s)
+    }
+
+    fn view(a: &Vec<u8>) -> String {
+        str::from_utf8(a).unwrap().to_string()
+    }
+
     #[test]
     fn test_re4() -> Result<(), std::io::Error> {
         use fancy_regex::{Regex, escape};
@@ -230,9 +256,9 @@ mod core {
             });
             r
         };
-        
+
         // mapping a pretoken (Vec<u8>) => pretoken_id(u64)
-        let (pretoken_dict, pretoken_state) = {
+        let (pretoken_dict, mut pretoken_state) = {
             // mapping Vec<u8> => id(u64)
             let mut d = HashMap::new();
             let mut pre_state: HashMap<u64, PreState> = HashMap::new();
@@ -248,46 +274,187 @@ mod core {
                         pre_token_cnt += 1;
                         d.insert(m.as_bytes().to_vec(), pre_token_cnt);
                         pre_state.insert(
-                            pre_token_cnt, PreState::from(m.as_bytes(), &vocab).ok_or(InvalidInput)?
+                            pre_token_cnt,
+                            PreState::from(m.as_bytes(), &vocab).ok_or(InvalidInput)?,
                         );
                     }
                 }
             }
             (d, pre_state)
         };
-        let mut byte_group_heap = {
+        let mut group_pair_heap = {
             // vocab_id_pair => ByteGroupState
-            let mut byte_group_state: HashMap<(u64, u64), ByteGroupState> = HashMap::new();
+            let mut group_pair_state: HashMap<(u64, u64), GroupPairState> = HashMap::new();
             for (pre_id, pre) in &pretoken_state {
                 // e.g. pretoken_id: 12, "word"
                 for (x_idx, (x, y)) in pre.bytes.windows(2).map(|w| (w[0], w[1])).enumerate() {
                     let id_x = *vocab.get([x].as_slice()).ok_or(InvalidInput)?;
                     let id_y = *vocab.get([y].as_slice()).ok_or(InvalidInput)?;
-                    let state = byte_group_state.entry((id_x, id_y)).or_insert(
-                        ByteGroupState {
+                    let state = group_pair_state
+                        .entry((id_x, id_y))
+                        .or_insert(GroupPairState {
                             vocab_id_pair: (id_x, id_y),
                             cnt: 0,
-                            pre_indices: Vec::new(),
-                        }
-                    );
+                            pre_indices: HashSet::new(),
+                        });
                     state.cnt += pre.cnt;
-                    state.pre_indices.push((*pre_id as u64, x_idx as i16));
+                    let _ = state.pre_indices.insert((*pre_id as u64, x_idx as i16));
+                    let dbg1 = str::from_utf8(&pre.bytes).unwrap();
+                    println!("push {pre_id} {x_idx} dbg1: {dbg1}");
                 }
             }
-            let mut heap: BinaryHeap<ByteGroupState> = BinaryHeap::new();
-            for state in byte_group_state.values() {
+            let mut heap: BinaryHeap<GroupPairState> = BinaryHeap::new();
+            for state in group_pair_state.values() {
                 heap.push(state.clone());
             }
             heap
         };
         // start merging!
         // 若在 heap 中，则 (id_x, id_y) 必然不在 vocab 中
-        while let Some(state) = byte_group_heap.pop() {
-            let (id_x, id_y) = state.vocab_id_pair;
-            let x = rev_vocab.get(&id_x).ok_or(InvalidInput)?;
-            let y = rev_vocab.get(&id_y).ok_or(InvalidInput)?;
-        }
+        // vocab_id_pair: (u64, u64),
+        // cnt: u64,
+        // pre_indices: Vec<(u64, i16)>,
+        let mut lazy_deletions = HashMap::<(u64, u64), HashSet<(u64, i16)>>::new();
 
+        while let Some(mut state) = group_pair_heap.pop() {
+            let (x_id, y_id) = state.vocab_id_pair;
+            if let Some(to_delete) = lazy_deletions.remove(&(x_id, y_id)) {
+                for (pre_id, pre_idx) in to_delete {
+                    state
+                        .pre_indices
+                        .remove(&(pre_id, pre_idx))
+                        .then_some(())
+                        .ok_or(invalid(format!("remove non existing")))?;
+                    state.cnt -= pretoken_state
+                        .get(&pre_id)
+                        .ok_or(invalid(format!("pretoken_state.get {pre_id}")))?
+                        .cnt;
+                }
+                group_pair_heap.push(state);
+                continue;
+            }
+            let x = rev_vocab.get(&x_id).ok_or(InvalidInput)?.clone();
+            let y = rev_vocab.get(&y_id).ok_or(InvalidInput)?.clone();
+            let new_group = [x.clone(), y.clone()].concat();
+            let new_id = vocab.len() as u64;
+            vocab.insert(new_group.clone(), new_id);
+            let dbg_new_group = str::from_utf8(&new_group).unwrap();
+            let dbg_x = str::from_utf8(&x).unwrap();
+            let dbg_y = str::from_utf8(&y).unwrap();
+            rev_vocab.insert(new_id, new_group);
+            // maps vocab_id_pair to GroupPairState
+            let mut vocab_id_pair_map = HashMap::new();
+            for (pretoken_id, x_idx) in state.pre_indices {
+                let dbg_keys = pretoken_state.keys().cloned().collect::<Vec<_>>();
+                let y_idx = x_idx + x.len() as i16;
+                let pretoken = pretoken_state
+                    .get_mut(&pretoken_id)
+                    .ok_or(invalid(format!("keys {:?} {}", dbg_keys, pretoken_id)))?;
+                let pre_x_idx = *pretoken
+                    .pre
+                    .get(x_idx as usize)
+                    .ok_or(invalid(format!("pre_x_idx {x_idx}")))?;
+                let dbg1 = str::from_utf8(&pretoken.bytes).unwrap();
+                let dbg2 = str::from_utf8(&x).unwrap();
+                let nxt_y_idx = *pretoken.nxt.get(y_idx as usize).ok_or(invalid(format!(
+                    "nxt_y_idx {}|{}|{}",
+                    x_idx as usize + x.len(),
+                    dbg1,
+                    dbg2
+                )))?;
+                if pre_x_idx > -1 {
+                    // |      |     |
+                    // pre_x--x--y--nxt_y
+                    let pre_id = pretoken
+                        .vocab_id_at
+                        .get(pre_x_idx as usize)
+                        .ok_or(InvalidInput)?;
+                    let new_vocab_id_pair = (*pre_id, new_id);
+                    let dbg_pre = view(rev_vocab.get(pre_id).ok_or(InvalidInput)?);
+                    let dbg_new = view(rev_vocab.get(&new_id).ok_or(InvalidInput)?);
+                    println!("ins {new_id}|{dbg_new}|{dbg_pre}|");
+                    // add (pre_x, xy)
+                    let state = vocab_id_pair_map
+                        .entry(new_vocab_id_pair)
+                        .or_insert_with(|| GroupPairState {
+                            vocab_id_pair: new_vocab_id_pair,
+                            cnt: 0,
+                            pre_indices: HashSet::new(),
+                        });
+                    let _ = state.pre_indices.insert((pretoken_id, pre_x_idx));
+                    state.cnt += pretoken.cnt;
+
+                    // lazy delete (pre_x, x)
+                    let to_delete = lazy_deletions
+                        .entry((*pre_id, x_id))
+                        .or_insert_with(|| HashSet::new());
+                    let _ = to_delete.insert((pretoken_id, pre_x_idx));
+                }
+                if nxt_y_idx < pretoken.bytes.len() as i16 {
+                    // |      |     |
+                    // pre_x--x--y--nxt_y
+                    *pretoken
+                        .pre
+                        .get_mut(nxt_y_idx as usize)
+                        .ok_or(InvalidInput)? = pre_x_idx;
+                    let nxt_id = pretoken
+                        .vocab_id_at
+                        .get(nxt_y_idx as usize)
+                        .ok_or(InvalidInput)?;
+                    // add (xy, nxt_y)
+                    let new_vocab_id_pair = (new_id, *nxt_id);
+                    let state = vocab_id_pair_map
+                        .entry(new_vocab_id_pair)
+                        .or_insert_with(|| GroupPairState {
+                            vocab_id_pair: new_vocab_id_pair,
+                            cnt: 0,
+                            pre_indices: HashSet::new(),
+                        });
+                    let _ = state.pre_indices.insert((pretoken_id, x_idx));
+                    println!("push2: {pretoken_id} {x_idx}");
+                    state.cnt += pretoken.cnt;
+
+                    // lazy delete (y, nxt_y)
+                    let to_delete = lazy_deletions
+                        .entry((y_id, *nxt_id))
+                        .or_insert_with(|| HashSet::new());
+                    let _ = to_delete.insert((pretoken_id, y_idx));
+
+                    // maintain pretoken
+                    *pretoken
+                        .pre
+                        .get_mut(nxt_y_idx as usize)
+                        .ok_or(InvalidInput)? = x_idx;
+                }
+                *pretoken
+                    .vocab_id_at
+                    .get_mut(x_idx as usize)
+                    .ok_or(InvalidInput)? = new_id;
+                *pretoken
+                    .vocab_id_at
+                    .get_mut(y_idx as usize)
+                    .ok_or(InvalidInput)? = u64::MIN;
+                *pretoken.nxt.get_mut(x_idx as usize).ok_or(InvalidInput)? = nxt_y_idx;
+                let dbg_pretoken = str::from_utf8(&pretoken.bytes).unwrap();
+                println!("vocab_id_at[{}] = {:?}", dbg_pretoken, pretoken.vocab_id_at);
+                println!(
+                    "vocab_id_at[{}] = {:?}",
+                    dbg_pretoken,
+                    pretoken
+                        .vocab_id_at
+                        .iter()
+                        .map(|v| if v != &u64::MIN {
+                            view(rev_vocab.get(v).unwrap())
+                        } else {
+                            "".to_string()
+                        })
+                        .collect::<Vec<_>>()
+                );
+            }
+            for (_, state) in vocab_id_pair_map.iter() {
+                group_pair_heap.push(state.clone());
+            }
+        }
         for m in re.find_iter(t) {
             if let Ok(m) = m
                 && !special_tokens.contains(&m.as_str().trim())
