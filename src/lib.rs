@@ -97,7 +97,7 @@ mod core {
     // (id, id) => ByteGroupState
     // 可能会 concat 两个 vocab_id 加入 vocab
     type FixedHasher = BuildHasherDefault<SipHasher13>;
-    #[derive(PartialEq, Eq, Clone)]
+    #[derive(PartialEq, Eq, Clone, Debug)]
     pub struct GroupPairState {
         pub vocab_id_pair: (u64, u64),
         pub cnt: u64,
@@ -320,18 +320,19 @@ mod tests {
                     if let Some(id) = d.get(m.as_bytes()) {
                         pre_state.get_mut(id).ok_or(InvalidInput)?.cnt += 1;
                     } else {
-                        pre_token_cnt += 1;
                         let _ = d.insert(m.as_bytes().to_vec(), pre_token_cnt);
                         let _ = pre_state.insert(
                             pre_token_cnt,
                             PreState::from(m.as_bytes(), &vocab).ok_or(InvalidInput)?,
                         );
+                        pre_token_cnt += 1;
                     }
                 }
             }
             (d, pre_state)
         };
 
+        eprintln!("pretoken_dict size: {}", pretoken_state.len());
         eprintln!("group_pair_heap");
 
         let mut group_pair_heap = {
@@ -366,7 +367,8 @@ mod tests {
         // vocab_id_pair: (u64, u64),
         // cnt: u64,
         // pre_indices: Vec<(u64, i16)>,
-        let mut lazy_deletions = HashMap::<(u64, u64), HashSet<(u64, i16), _>>::new();
+        let mut lazy_deletions =
+            HashMap::<(u64, u64), HashSet<(u64, i16), _>, _>::with_hasher(hasher());
 
         let mut dbg_cnt = 0;
         eprintln!("popping");
@@ -374,26 +376,6 @@ mod tests {
             && let Some(mut state) = group_pair_heap.pop()
         {
             let (x_id, y_id) = state.vocab_id_pair;
-            if let Some(to_delete) = lazy_deletions.remove(&(x_id, y_id)) {
-                for (pre_id, pre_idx) in to_delete {
-                    state
-                        .pre_indices
-                        .remove(&(pre_id, pre_idx))
-                        .then_some(())
-                        .ok_or(invalid(format!("remove non existing")))?;
-                    state.cnt -= pretoken_state
-                        .get(&pre_id)
-                        .ok_or(invalid(format!("pretoken_state.get {pre_id}")))?
-                        .cnt;
-                }
-                group_pair_heap.push(state);
-                continue;
-            }
-            if state.cnt == 0 {
-                eprintln!("skip cuz cnt == 0");
-                continue;
-            }
-
             let x = rev_vocab.get(&x_id).ok_or(InvalidInput)?.clone();
             let y = rev_vocab.get(&y_id).ok_or(InvalidInput)?.clone();
             let new_group = [x.clone(), y.clone()].concat();
@@ -405,6 +387,35 @@ mod tests {
                 new_id
             });
             let dbg_new_group = str::from_utf8(&new_group).unwrap_or("...");
+
+            if let Some(to_delete) = lazy_deletions.remove(&(x_id, y_id)) {
+                for (pre_id, pre_idx) in to_delete {
+                    state
+                        .pre_indices
+                        .remove(&(pre_id, pre_idx))
+                        .then_some(())
+                        .ok_or(invalid(format!(
+                            "remove non existing: <{}> {},{} all: {:?} but tried: {:?}",
+                            dbg_new_group,
+                            x_id,
+                            y_id,
+                            state.pre_indices,
+                            (pre_id, pre_idx),
+                        )))?;
+                    state.cnt -= pretoken_state
+                        .get(&pre_id)
+                        .ok_or(invalid(format!("pretoken_state.get {pre_id}")))?
+                        .cnt;
+                }
+                group_pair_heap.push(state);
+                continue;
+            }
+
+            if state.cnt == 0 {
+                eprintln!("skip cuz cnt == 0");
+                continue;
+            }
+
             dbg_cnt += 1;
             if dbg_cnt < 50 {
                 eprintln!("inserted <{}> as {}", dbg_new_group, new_id);
@@ -413,7 +424,7 @@ mod tests {
             // println!("insert new word: |{dbg_new_group}|");
             let _ = rev_vocab.insert(new_id, new_group);
             // maps vocab_id_pair to GroupPairState
-            let mut vocab_id_pair_map = HashMap::new();
+            let mut vocab_id_pair_map = HashMap::with_hasher(hasher());
 
             for (pretoken_id, x_idx) in state.pre_indices {
                 let dbg_keys = pretoken_state.keys().cloned().collect::<Vec<_>>();
@@ -478,13 +489,31 @@ mod tests {
                             pre_indices: HashSet::with_hasher(hasher()),
                         });
                     let _ = state.pre_indices.insert((pretoken_id, pre_x_idx));
+                    if pretoken_id == 0 && pre_x_idx == 24 {
+                        eprintln!(
+                            "to-add -------------- {} {} | {} {}",
+                            pre_id,
+                            new_id,
+                            rev_vocab.get(&pre_id).unwrap().len(),
+                            rev_vocab.get(&new_id).unwrap().len()
+                        );
+                    }
                     state.cnt += pretoken.cnt;
 
                     // lazy delete (pre_x, x)
                     let to_delete = lazy_deletions
-                        .entry((pre_id, x_id))
+                        .entry((pre_id, x_id)) // group
                         .or_insert_with(|| HashSet::with_hasher(hasher()));
                     let _ = to_delete.insert((pretoken_id, pre_x_idx));
+                    if pretoken_id == 0 && pre_x_idx == 24 {
+                        eprintln!(
+                            "to-delete -------------- {} {} | {} {}",
+                            pre_id,
+                            x_id,
+                            rev_vocab.get(&pre_id).unwrap().len(),
+                            rev_vocab.get(&x_id).unwrap().len()
+                        );
+                    }
                 }
                 if nxt_y_idx < pretoken.bytes.len() as i16 {
                     // |      |     |
@@ -513,11 +542,31 @@ mod tests {
                     let _ = state.pre_indices.insert((pretoken_id, x_idx));
                     state.cnt += pretoken.cnt;
 
+                    if pretoken_id == 0 && x_idx == 24 {
+                        eprintln!(
+                            "to-add -------------- {} {} | {} {}",
+                            new_id,
+                            nxt_id,
+                            rev_vocab.get(&new_id).unwrap().len(),
+                            rev_vocab.get(&nxt_id).unwrap().len()
+                        );
+                    }
+
                     // lazy delete (y, nxt_y)
                     let to_delete = lazy_deletions
                         .entry((y_id, nxt_id))
                         .or_insert_with(|| HashSet::with_hasher(hasher()));
                     let _ = to_delete.insert((pretoken_id, y_idx));
+
+                    if pretoken_id == 0 && y_idx == 24 {
+                        println!(
+                            "-----z------ {} {} | {} {}",
+                            y_id,
+                            nxt_id,
+                            rev_vocab.get(&y_id).unwrap().len(),
+                            rev_vocab.get(&nxt_id).unwrap().len()
+                        );
+                    }
 
                     // maintain pretoken
                     *pretoken
@@ -534,23 +583,25 @@ mod tests {
                     .get_mut(y_idx as usize)
                     .ok_or(InvalidInput)? = None;
                 *pretoken.nxt.get_mut(x_idx as usize).ok_or(InvalidInput)? = nxt_y_idx;
-                let dbg_pretoken = str::from_utf8(&pretoken.bytes).unwrap_or("...");
-                println!("vocab_id_at[{}] = {:?}", dbg_pretoken, pretoken.vocab_id_at);
-                println!(
-                    "vocab_id_at[{}] = {:?}",
-                    dbg_pretoken,
-                    pretoken
-                        .vocab_id_at
-                        .iter()
-                        .map(|v| if let Some(v) = v {
-                            view(rev_vocab.get(v).unwrap())
-                        } else {
-                            "".to_string()
-                        })
-                        .collect::<Vec<_>>()
-                );
+
+                // let dbg_pretoken= str::from_utf8(&pretoken.bytes).unwrap_or("...");
+                // println!("vocab_id_at[{}] = {:?}", dbg_pretoken, pretoken.vocab_id_at);
+                // println!(
+                //     "vocab_id_at[{}] = {:?}",
+                //     dbg_pretoken,
+                //     pretoken
+                //         .vocab_id_at
+                //         .iter()
+                //         .map(|v| if let Some(v) = v {
+                //             view(rev_vocab.get(v).unwrap())
+                //         } else {
+                //             "".to_string()
+                //         })
+                //         .collect::<Vec<_>>()
+                // );
             }
             for (_, state) in vocab_id_pair_map.iter() {
+                eprintln!("add state {:?}", state);
                 group_pair_heap.push(state.clone());
             }
         }
