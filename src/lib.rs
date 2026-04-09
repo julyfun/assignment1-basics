@@ -1,19 +1,16 @@
-#![allow(unused_variables)]
 #![deny(unused_results)]
-
-const NUM_PROCESSES: usize = 32;
-const MINI_CHUNK_SIZE: usize = 1 << 12;
-const PAT: &str = r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#;
 
 #[pyo3::pymodule]
 #[cfg(feature = "pyo3-extension")]
 mod cs336_basics {
+    use super::core;
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
     use pyo3::types::{IntoPyDict, PyAny, PyDict};
     use pyo3_stub_gen::derive::gen_stub_pyfunction;
     use std::collections::HashMap;
     use std::fs::File;
+    use std::io::ErrorKind::InvalidInput;
     use std::io::{BufReader, Read, Seek, SeekFrom};
 
     #[gen_stub_pyfunction]
@@ -26,38 +23,38 @@ mod cs336_basics {
     /// This is a test comment.
     #[gen_stub_pyfunction]
     #[pyfunction]
-    #[pyo3(signature = (path, vocab_size, special_tokens), text_signature = "(path: str, vocab_size: int, special_tokens: list[str]) -> str")]
-    fn train(path: &str, vocab_size: usize, special_tokens: Vec<String>) -> PyResult<String> {
-        // read from path
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let bs = find_chunk_boundaries(&mut reader, NUM_PROCESSES, b"<|endoftext|>")?;
-        // let mut buffer = vec![0u8];
-        // for (start, end) in bs.windows(2).map(|w| (w[0], w[1])) {
-        //     reader.seek(SeekFrom::Start(start as u64))?;
-        //     buffer.resize(end - start, 0);
-        //     reader.read(&mut buffer)?;
-        // }
-
-        // let re = fancy_regex::Regex::new(PAT).map_err(|e|
-        //     PyValueError::new_err(e.to_string())
-        // )?;
-        // for m in re.find_iter("test") {
-        // }
-        Ok(path.to_string())
+    #[pyo3(signature = (path, vocab_size, special_tokens), text_signature = "(path: str, vocab_size: int, special_tokens: list[str]) -> (dict[int, bytes], list[tuple[bytes, bytes]])")]
+    fn train(
+        path: &str,
+        vocab_size: usize,
+        special_tokens: Vec<String>,
+    ) -> PyResult<(HashMap<u64, Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>)> {
+        core::train(path, vocab_size, special_tokens)
+            .map(|(vocab, merges)| {
+                let vocab_common_hash: HashMap<u64, Vec<u8>> = vocab.into_iter().collect();
+                (vocab_common_hash, merges)
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
-    // pretoken
 }
 
 mod core {
     use siphasher::sip::SipHasher13;
 
-    use super::*;
     use std::collections::{BinaryHeap, HashMap, HashSet};
     use std::fs::File;
     use std::hash::BuildHasherDefault;
     use std::io::ErrorKind::InvalidInput;
     use std::io::{BufReader, Error, Read, Seek, SeekFrom};
+
+    pub const NUM_PROCESSES: usize = 32;
+    pub const MINI_CHUNK_SIZE: usize = 1 << 12;
+    pub const PAT: &str =
+        r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#;
+
+    pub fn invalid(s: String) -> std::io::Error {
+        std::io::Error::new(InvalidInput, s)
+    }
 
     // id => PreState
     /// merges the same pretokens
@@ -128,7 +125,7 @@ mod core {
         }
     }
 
-    pub fn find_chunk_boundaries(
+    fn find_chunk_boundaries(
         file: &mut (impl Read + Seek),
         desired_num_chunks: usize,
         end_token: &[u8],
@@ -169,43 +166,366 @@ mod core {
         Ok(boundaries)
     }
 
-    fn train(
+    pub fn train(
         path: &str,
         vocab_size: usize,
         special_tokens: Vec<String>,
-    ) -> Result<String, std::io::Error> {
-        // read from path
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let bs = find_chunk_boundaries(&mut reader, NUM_PROCESSES, b"<|endoftext|>")?;
-        // let mut buffer = vec![0u8];
-        // for (start, end) in bs.windows(2).map(|w| (w[0], w[1])) {
-        //     reader.seek(SeekFrom::Start(start as u64))?;
-        //     buffer.resize(end - start, 0);
-        //     reader.read(&mut buffer)?;
-        // }
+    ) -> Result<(HashMap<u64, Vec<u8>, FixedHasher>, Vec<(Vec<u8>, Vec<u8>)>), std::io::Error> {
+        use fancy_regex::{Regex, escape};
+        use rayon::prelude::*;
 
-        // let re = fancy_regex::Regex::new(PAT).map_err(|e|
-        //     PyValueError::new_err(e.to_string())
-        // )?;
-        // for m in re.find_iter("test") {
-        // }
-        Ok(path.to_string())
+        let special_tokens1: Vec<String> = special_tokens
+            .iter()
+            .map(|x| escape(x).to_string())
+            .collect();
+        let pat = " ?(?:".to_string() + special_tokens1.join("|").as_str() + ")|" + PAT;
+        // let t = std::fs::read_to_string("data/TinyStoriesV2-GPT4-train.txt")?;
+        let file = File::open(path)?;
+        let mut boundary_reader = BufReader::new(file);
+        let boundaries =
+            find_chunk_boundaries(&mut boundary_reader, NUM_PROCESSES, b"<|endoftext|>")?;
+        let chunk_ranges = boundaries
+            .windows(2)
+            .map(|w| (w[0], w[1]))
+            .filter(|(start, end)| start < end)
+            .collect::<Vec<_>>();
+
+        // byte group => its id
+        let mut rev_vocab = {
+            let mut v = HashMap::with_hasher(hasher());
+            special_tokens.iter().enumerate().for_each(|(i, x)| {
+                let _ = v.insert(x.as_bytes().to_vec(), i as u64);
+            });
+            (0..256).for_each(|i| {
+                let _ = v.insert(vec![i as u8], (special_tokens.len() + i as usize) as u64);
+            });
+            v
+        };
+        let mut vocab = {
+            let mut r = HashMap::with_hasher(hasher());
+            rev_vocab.iter().for_each(|(k, v)| {
+                let _ = r.insert(*v, k.clone());
+            });
+            r
+        };
+
+        eprintln!("[stage.pretokenize]");
+        // mapping a pretoken (Vec<u8>) => pretoken_id(u64)
+        let (_pretoken_dict, mut pretoken_state) = {
+            let local_counts = chunk_ranges
+                .par_iter()
+                .map(
+                    |(start, end)| -> Result<HashMap<Vec<u8>, u64, _>, std::io::Error> {
+                        let mut local = HashMap::<Vec<u8>, u64, _>::with_hasher(hasher());
+                        let mut reader = BufReader::new(File::open(path)?);
+                        let _ = reader.seek(SeekFrom::Start(*start as u64))?;
+                        let mut buffer = vec![0u8; end - start];
+                        let _ = reader.read(&mut buffer)?;
+                        let chunk = str::from_utf8(&buffer).map_err(|_| InvalidInput)?;
+                        let local_re = Regex::new(pat.as_str())
+                            .map_err(|_| invalid("regex should compile".to_string()))?;
+                        for m in local_re.find_iter(chunk) {
+                            if let Ok(m) = m
+                                && !special_tokens.contains(&m.as_str().trim().to_string())
+                            {
+                                let entry =
+                                    local.entry(m.as_str().as_bytes().to_vec()).or_insert(0);
+                                *entry += 1;
+                            }
+                        }
+                        Ok(local)
+                    },
+                )
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut merged_counts = HashMap::<Vec<u8>, u64, _>::with_hasher(hasher());
+            for local in local_counts {
+                for (tok, tok_cnt) in local {
+                    let entry = merged_counts.entry(tok).or_insert(0);
+                    *entry += tok_cnt;
+                }
+            }
+
+            // mapping Vec<u8> => id(u64)
+            let mut d = HashMap::with_hasher(hasher());
+            let mut pre_state: HashMap<u64, PreState, _> = HashMap::with_hasher(hasher());
+            let mut pre_token_cnt: u64 = 0;
+            for (tok, tok_cnt) in merged_counts {
+                let _ = d.insert(tok.clone(), pre_token_cnt);
+                let mut state = PreState::from(tok.as_slice(), &rev_vocab).ok_or(InvalidInput)?;
+                state.cnt = tok_cnt;
+                let _ = pre_state.insert(pre_token_cnt, state);
+                pre_token_cnt += 1;
+            }
+            (d, pre_state)
+        };
+
+        eprintln!("pretoken_dict size: {}", pretoken_state.len());
+        eprintln!("[stage.build-heap]");
+
+        let (mut group_pair_heap, mut group_pair_state) = {
+            // vocab_id_pair => ByteGroupState
+            let mut group_pair_state: HashMap<(u64, u64), GroupPairState, _> =
+                HashMap::with_hasher(hasher());
+            for (pre_id, pre) in &pretoken_state {
+                // e.g. pretoken_id: 12, "word"
+                for (x_idx, (x, y)) in pre.bytes.windows(2).map(|w| (w[0], w[1])).enumerate() {
+                    let id_x = *rev_vocab.get([x].as_slice()).ok_or(InvalidInput)?;
+                    let id_y = *rev_vocab.get([y].as_slice()).ok_or(InvalidInput)?;
+                    let state = group_pair_state
+                        .entry((id_x, id_y))
+                        .or_insert(GroupPairState {
+                            cnt: 0,
+                            pre_indices: HashSet::with_hasher(hasher()),
+                            latest_ver: 0,
+                        });
+                    state.cnt += pre.cnt;
+                    let _ = state.pre_indices.insert((*pre_id as u64, x_idx as i16));
+                }
+            }
+            let mut heap: BinaryHeap<GroupPairCandidate> = BinaryHeap::new();
+            for (vocab_ids, state) in group_pair_state.iter() {
+                heap.push(GroupPairCandidate {
+                    ver: state.latest_ver,
+                    cnt: state.cnt,
+                    vocab_ids: *vocab_ids,
+                });
+            }
+            (heap, group_pair_state)
+        };
+        // start merging!
+        // 若在 heap 中，则 (id_x, id_y) 必然不在 vocab 中
+        // vocab_id_pair: (u64, u64),
+        // cnt: u64,
+        // pre_indices: Vec<(u64, i16)>,
+        // let mut lazy_deletions =
+        //     HashMap::<(u64, u64), HashSet<(u64, i16), _>, _>::with_hasher(hasher());
+        // let mut group_pair_latest_version = HashMap::<(u64, u64), u64, _>::with_hasher(hasher());
+
+        let mut dbg_cnt = 0;
+        eprintln!("[stage.merge]");
+        let mut merges: Vec<(Vec<u8>, Vec<u8>)> = vec![];
+        while rev_vocab.len() < vocab_size {
+            let Some(candidate) = group_pair_heap.pop() else {
+                break;
+            };
+
+            let (x_id, y_id) = candidate.vocab_ids;
+            let state = group_pair_state
+                .get(&(x_id, y_id))
+                .ok_or(invalid("not in `group_pair_state`".to_string()))?
+                .clone();
+            if candidate.ver != state.latest_ver {
+                continue;
+            }
+
+            let x = vocab.get(&x_id).ok_or(InvalidInput)?.clone();
+            let y = vocab.get(&y_id).ok_or(InvalidInput)?.clone();
+            let new_group = [x.clone(), y.clone()].concat();
+            // let new_id = vocab.len() as u64;
+            // let _ = vocab.insert(new_group.clone(), new_id);
+            let new_id = rev_vocab.get(&new_group).copied().unwrap_or_else(|| {
+                let new_id = rev_vocab.len() as u64;
+                let _ = rev_vocab.insert(new_group.clone(), new_id);
+                new_id
+            });
+            let dbg_new_group = str::from_utf8(&new_group).unwrap_or("...");
+
+            if candidate.cnt == 0 {
+                eprintln!("skip cuz cnt == 0");
+                continue;
+            }
+
+            dbg_cnt += 1;
+            if dbg_cnt < 50 {
+                eprintln!("inserted <{}> as {}", dbg_new_group, new_id);
+            }
+
+            let _ = merges.push((x.clone(), y.clone()));
+
+            // println!("insert new word: |{dbg_new_group}|");
+            let _ = vocab.insert(new_id, new_group);
+            // maps vocab_id_pair to GroupPairState
+
+            for (pretoken_id, x_idx) in &state.pre_indices {
+                let (pretoken_id, x_idx) = (*pretoken_id, *x_idx);
+                let y_idx = x_idx + x.len() as i16;
+                let pretoken = pretoken_state
+                    .get_mut(&pretoken_id)
+                    .ok_or(invalid(format!("keys")))?;
+                // vocab_id_at must exist
+                // if pretoken.vocab_id_at.get(x_idx as usize).is_none()
+                //     || pretoken.vocab_id_at.get(y_idx as usize).is_none()
+                // {
+                //     continue;
+                // }
+                if let (Some(actual_x_id_here), Some(actual_y_id_here)) = (
+                    pretoken
+                        .vocab_id_at
+                        .get(x_idx as usize)
+                        .ok_or(InvalidInput)?,
+                    pretoken
+                        .vocab_id_at
+                        .get(y_idx as usize)
+                        .ok_or(InvalidInput)?,
+                ) {
+                    if *actual_x_id_here != x_id || *actual_y_id_here != y_id {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+
+                let pre_x_idx = *pretoken
+                    .pre
+                    .get(x_idx as usize)
+                    .ok_or(invalid(format!("pre_x_idx {x_idx}")))?;
+                let dbg1 = str::from_utf8(&pretoken.bytes).unwrap_or("...");
+                let dbg2 = str::from_utf8(&x).unwrap_or("...");
+                let nxt_y_idx = *pretoken.nxt.get(y_idx as usize).ok_or(invalid(format!(
+                    "nxt_y_idx {}|{}|{}",
+                    x_idx as usize + x.len(),
+                    dbg1,
+                    dbg2,
+                )))?;
+
+                fn add_new_group_pair(
+                    vocab_ids: (u64, u64),
+                    pretoken_id: u64,
+                    pretoken_cnt: u64,
+                    idx_in_pretoken: i16,
+                    state: &mut HashMap<(u64, u64), GroupPairState, FixedHasher>,
+                    heap: &mut BinaryHeap<GroupPairCandidate>,
+                ) {
+                    let state = state.entry(vocab_ids).or_insert_with(|| GroupPairState {
+                        cnt: 0,
+                        pre_indices: HashSet::with_hasher(hasher()),
+                        latest_ver: 0,
+                    });
+                    let _ = state.pre_indices.insert((pretoken_id, idx_in_pretoken));
+                    state.cnt += pretoken_cnt;
+                    state.latest_ver += 1;
+                    let _ = heap.push(GroupPairCandidate {
+                        cnt: state.cnt,
+                        ver: state.latest_ver,
+                        vocab_ids: vocab_ids,
+                    });
+                }
+
+                if pre_x_idx > -1 {
+                    // |      |     |
+                    // pre_x--x--y--nxt_y
+                    let pre_id = pretoken
+                        .vocab_id_at
+                        .get(pre_x_idx as usize)
+                        .ok_or(InvalidInput)?
+                        .ok_or(invalid(format!(concat!(
+                            line!(),
+                            ":vocab_id_at[] exists and is None",
+                        ))))?;
+                    let new_vocab_id_pair = (pre_id, new_id);
+                    let dbg_pre = view(vocab.get(&pre_id).ok_or(InvalidInput)?);
+                    let dbg_new = view(vocab.get(&new_id).ok_or(InvalidInput)?);
+                    // add (pre_x, xy)
+                    add_new_group_pair(
+                        new_vocab_id_pair,
+                        pretoken_id,
+                        pretoken.cnt,
+                        pre_x_idx,
+                        &mut group_pair_state,
+                        &mut group_pair_heap,
+                    );
+                }
+                if nxt_y_idx < pretoken.bytes.len() as i16 {
+                    // |      |     |
+                    // pre_x--x--y--nxt_y
+                    *pretoken
+                        .pre
+                        .get_mut(nxt_y_idx as usize)
+                        .ok_or(InvalidInput)? = pre_x_idx;
+                    let nxt_id = pretoken
+                        .vocab_id_at
+                        .get(nxt_y_idx as usize)
+                        .ok_or(InvalidInput)?
+                        .ok_or(invalid(format!(concat!(
+                            line!(),
+                            ":vocab_id_at[] exists and is None",
+                        ))))?;
+                    // add (xy, nxt_y)
+                    let new_vocab_id_pair = (new_id, nxt_id);
+                    add_new_group_pair(
+                        new_vocab_id_pair,
+                        pretoken_id,
+                        pretoken.cnt,
+                        x_idx,
+                        &mut group_pair_state,
+                        &mut group_pair_heap,
+                    );
+
+                    // maintain pretoken
+                    *pretoken
+                        .pre
+                        .get_mut(nxt_y_idx as usize)
+                        .ok_or(InvalidInput)? = x_idx;
+                }
+                *pretoken
+                    .vocab_id_at
+                    .get_mut(x_idx as usize)
+                    .ok_or(InvalidInput)? = Some(new_id);
+                *pretoken
+                    .vocab_id_at
+                    .get_mut(y_idx as usize)
+                    .ok_or(InvalidInput)? = None;
+                *pretoken.nxt.get_mut(x_idx as usize).ok_or(InvalidInput)? = nxt_y_idx;
+
+                // let dbg_pretoken = str::from_utf8(&pretoken.bytes).unwrap_or("...");
+                // println!("vocab_id_at[{}] = {:?}", dbg_pretoken, pretoken.vocab_id_at);
+                // println!(
+                //     "vocab_id_at[{}] = {:?}",
+                //     dbg_pretoken,
+                //     pretoken
+                //         .vocab_id_at
+                //         .iter()
+                //         .map(|v| if let Some(v) = v {
+                //             view(rev_vocab.get(v).unwrap())
+                //         } else {
+                //             "".to_string()
+                //         })
+                //         .collect::<Vec<_>>()
+                // );
+            }
+        }
+        Ok((vocab, merges))
+    }
+
+    fn view(a: &Vec<u8>) -> String {
+        str::from_utf8(a).unwrap_or("...").to_string()
+    }
+
+    fn hasher() -> BuildHasherDefault<SipHasher13> {
+        BuildHasherDefault::<SipHasher13>::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::core::*;
-    use super::*;
-    use siphasher::sip::SipHasher13;
-    use std::collections::{BinaryHeap, HashMap, HashSet};
-    use std::fs::File;
-    use std::hash::BuildHasherDefault;
-    use std::io::ErrorKind::InvalidInput;
-    use std::io::{BufReader, Error, Read, Seek, SeekFrom};
     use std::sync::Once;
     use std::time::{Duration, Instant};
+
+    fn init_tracing() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive("info".parse().expect("valid directive")),
+                )
+                .with_target(false)
+                .without_time()
+                .try_init();
+        });
+    }
 
     #[test]
     fn test_regex() -> Result<(), fancy_regex::Error> {
@@ -261,483 +581,15 @@ mod tests {
         Ok(())
     }
 
-    fn invalid(s: String) -> std::io::Error {
-        std::io::Error::new(InvalidInput, s)
-    }
-
-    fn view(a: &Vec<u8>) -> String {
-        str::from_utf8(a).unwrap_or("...").to_string()
-    }
-
-    fn hasher() -> BuildHasherDefault<SipHasher13> {
-        BuildHasherDefault::<SipHasher13>::default()
-    }
-
-    fn init_tracing() {
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::from_default_env()
-                        .add_directive("info".parse().expect("valid directive")),
-                )
-                .with_target(false)
-                .without_time()
-                .try_init();
-        });
-    }
-
-    #[derive(Default)]
-    struct PopTiming {
-        total_pop: u64,
-        stale_pop: u64,
-        t_heap_pop: Duration,
-        t_state_lookup: Duration,
-        t_stale_check: Duration,
-        t_build_new_group: Duration,
-        t_rev_vocab_insert: Duration,
-        t_preindices_total: Duration,
-        t_get_pretoken: Duration,
-        t_validate_pair: Duration,
-        t_neighbor_lookup: Duration,
-        t_add_pair_updates: Duration,
-        t_apply_pretoken: Duration,
-    }
-
-    impl PopTiming {
-        fn fmt_line(name: &str, d: Duration, total: Duration) -> String {
-            let ms = d.as_secs_f64() * 1_000.0;
-            let denom = total.as_secs_f64();
-            let pct = if denom > 0.0 {
-                d.as_secs_f64() / denom * 100.0
-            } else {
-                0.0
-            };
-            format!("{name:<20} {:>9.3} ms ({:>6.2}%)", ms, pct)
-        }
-
-        fn emit(&self, pop_wall: Duration) {
-            tracing::info!(
-                "pop_total={}, stale_pop={}, stale_ratio={:.2}%",
-                self.total_pop,
-                self.stale_pop,
-                if self.total_pop > 0 {
-                    self.stale_pop as f64 * 100.0 / self.total_pop as f64
-                } else {
-                    0.0
-                }
-            );
-            tracing::info!("{}", Self::fmt_line("pop_wall", pop_wall, pop_wall));
-            tracing::info!("{}", Self::fmt_line("heap_pop", self.t_heap_pop, pop_wall));
-            tracing::info!(
-                "{}",
-                Self::fmt_line("state_lookup", self.t_state_lookup, pop_wall)
-            );
-            tracing::info!(
-                "{}",
-                Self::fmt_line("stale_check", self.t_stale_check, pop_wall)
-            );
-            tracing::info!(
-                "{}",
-                Self::fmt_line("build_new_group", self.t_build_new_group, pop_wall)
-            );
-            tracing::info!(
-                "{}",
-                Self::fmt_line("rev_vocab_insert", self.t_rev_vocab_insert, pop_wall)
-            );
-            tracing::info!(
-                "{}",
-                Self::fmt_line("preindices_total", self.t_preindices_total, pop_wall)
-            );
-            tracing::info!(
-                "{}",
-                Self::fmt_line("get_pretoken", self.t_get_pretoken, pop_wall)
-            );
-            tracing::info!(
-                "{}",
-                Self::fmt_line("validate_pair", self.t_validate_pair, pop_wall)
-            );
-            tracing::info!(
-                "{}",
-                Self::fmt_line("neighbor_lookup", self.t_neighbor_lookup, pop_wall)
-            );
-            tracing::info!(
-                "{}",
-                Self::fmt_line("add_pair_updates", self.t_add_pair_updates, pop_wall)
-            );
-            tracing::info!(
-                "{}",
-                Self::fmt_line("apply_pretoken", self.t_apply_pretoken, pop_wall)
-            );
-        }
-    }
-
     #[test]
     fn test_re4() -> Result<(), std::io::Error> {
-        use fancy_regex::{Regex, escape};
-        use rayon::prelude::*;
-        const MAX_VOCAB_SIZE: usize = 10000;
-        init_tracing();
-
-        let special_tokens = vec!["<|endoftext|>"];
-        let special_tokens1: Vec<String> = special_tokens
-            .iter()
-            .map(|x| escape(x).to_string())
-            .collect();
-        let pat = " ?(?:".to_string() + special_tokens1.join("|").as_str() + ")|" + PAT;
-        let t = std::fs::read_to_string("data/TinyStoriesV2-GPT4-train.txt")?;
-        println!("t.len: {}", t.len());
-        let mut boundary_reader = BufReader::new(File::open("data/TinyStoriesV2-GPT4-train.txt")?);
-        let boundaries =
-            find_chunk_boundaries(&mut boundary_reader, NUM_PROCESSES, b"<|endoftext|>")?;
-        let chunk_ranges = boundaries
-            .windows(2)
-            .map(|w| (w[0], w[1]))
-            .filter(|(start, end)| start < end)
-            .collect::<Vec<_>>();
-        let re = Regex::new(pat.as_str()).map_err(|_| InvalidInput)?;
-
-        // byte group => its id
-        let mut vocab = {
-            let mut v = HashMap::with_hasher(hasher());
-            special_tokens.iter().enumerate().for_each(|(i, x)| {
-                let _ = v.insert(x.as_bytes().to_vec(), i as u64);
-            });
-            (0..256).for_each(|i| {
-                let _ = v.insert(vec![i as u8], (special_tokens.len() + i as usize) as u64);
-            });
-            v
-        };
-        let mut rev_vocab = {
-            let mut r = HashMap::with_hasher(hasher());
-            vocab.iter().for_each(|(k, v)| {
-                let _ = r.insert(*v, k.clone());
-            });
-            r
-        };
-
-        eprintln!("pretoken_dict");
-
-        // mapping a pretoken (Vec<u8>) => pretoken_id(u64)
-        let (pretoken_dict, mut pretoken_state) = {
-            let local_counts = chunk_ranges
-                .par_iter()
-                .map(|(start, end)| {
-                    let mut local = HashMap::<Vec<u8>, u64, _>::with_hasher(hasher());
-                    let chunk = str::from_utf8(&t.as_bytes()[*start..*end]).unwrap_or("");
-                    let local_re = Regex::new(pat.as_str()).expect("regex should compile");
-                    for m in local_re.find_iter(chunk) {
-                        if let Ok(m) = m
-                            && !special_tokens.contains(&m.as_str().trim())
-                        {
-                            let entry = local.entry(m.as_str().as_bytes().to_vec()).or_insert(0);
-                            *entry += 1;
-                        }
-                    }
-                    local
-                })
-                .collect::<Vec<_>>();
-
-            let mut merged_counts = HashMap::<Vec<u8>, u64, _>::with_hasher(hasher());
-            for local in local_counts {
-                for (tok, tok_cnt) in local {
-                    let entry = merged_counts.entry(tok).or_insert(0);
-                    *entry += tok_cnt;
-                }
-            }
-
-            // mapping Vec<u8> => id(u64)
-            let mut d = HashMap::with_hasher(hasher());
-            let mut pre_state: HashMap<u64, PreState, _> = HashMap::with_hasher(hasher());
-            let mut pre_token_cnt: u64 = 0;
-            for (tok, tok_cnt) in merged_counts {
-                let _ = d.insert(tok.clone(), pre_token_cnt);
-                let mut state = PreState::from(tok.as_slice(), &vocab).ok_or(InvalidInput)?;
-                state.cnt = tok_cnt;
-                let _ = pre_state.insert(pre_token_cnt, state);
-                pre_token_cnt += 1;
-            }
-            (d, pre_state)
-        };
-
-        eprintln!("pretoken_dict size: {}", pretoken_state.len());
-        eprintln!("group_pair_heap");
-
-        let (mut group_pair_heap, mut group_pair_state) = {
-            // vocab_id_pair => ByteGroupState
-            let mut group_pair_state: HashMap<(u64, u64), GroupPairState, _> =
-                HashMap::with_hasher(hasher());
-            for (pre_id, pre) in &pretoken_state {
-                // e.g. pretoken_id: 12, "word"
-                for (x_idx, (x, y)) in pre.bytes.windows(2).map(|w| (w[0], w[1])).enumerate() {
-                    let id_x = *vocab.get([x].as_slice()).ok_or(InvalidInput)?;
-                    let id_y = *vocab.get([y].as_slice()).ok_or(InvalidInput)?;
-                    let state = group_pair_state
-                        .entry((id_x, id_y))
-                        .or_insert(GroupPairState {
-                            cnt: 0,
-                            pre_indices: HashSet::with_hasher(hasher()),
-                            latest_ver: 0,
-                        });
-                    state.cnt += pre.cnt;
-                    let _ = state.pre_indices.insert((*pre_id as u64, x_idx as i16));
-                    let dbg1 = str::from_utf8(&pre.bytes).unwrap_or("...");
-                }
-            }
-            let mut heap: BinaryHeap<GroupPairCandidate> = BinaryHeap::new();
-            for (vocab_ids, state) in group_pair_state.iter() {
-                heap.push(GroupPairCandidate {
-                    ver: state.latest_ver,
-                    cnt: state.cnt,
-                    vocab_ids: *vocab_ids,
-                });
-            }
-            (heap, group_pair_state)
-        };
-        // start merging!
-        // 若在 heap 中，则 (id_x, id_y) 必然不在 vocab 中
-        // vocab_id_pair: (u64, u64),
-        // cnt: u64,
-        // pre_indices: Vec<(u64, i16)>,
-        // let mut lazy_deletions =
-        //     HashMap::<(u64, u64), HashSet<(u64, i16), _>, _>::with_hasher(hasher());
-        // let mut group_pair_latest_version = HashMap::<(u64, u64), u64, _>::with_hasher(hasher());
-
-        let mut dbg_cnt = 0;
-        let mut pop_timing = PopTiming::default();
-        let pop_wall_start = Instant::now();
-        eprintln!("popping");
-        while vocab.len() < MAX_VOCAB_SIZE {
-            let t = Instant::now();
-            let Some(candidate) = group_pair_heap.pop() else {
-                break;
-            };
-            pop_timing.t_heap_pop += t.elapsed();
-            pop_timing.total_pop += 1;
-
-            let (x_id, y_id) = candidate.vocab_ids;
-            let t = Instant::now();
-            let state = group_pair_state
-                .get(&(x_id, y_id))
-                .ok_or(invalid("not in `group_pair_state`".to_string()))?
-                .clone();
-            pop_timing.t_state_lookup += t.elapsed();
-
-            let t = Instant::now();
-            if candidate.ver != state.latest_ver {
-                pop_timing.stale_pop += 1;
-                pop_timing.t_stale_check += t.elapsed();
-                continue;
-            }
-            pop_timing.t_stale_check += t.elapsed();
-
-            let t = Instant::now();
-            let x = rev_vocab.get(&x_id).ok_or(InvalidInput)?.clone();
-            let y = rev_vocab.get(&y_id).ok_or(InvalidInput)?.clone();
-            let new_group = [x.clone(), y.clone()].concat();
-            // let new_id = vocab.len() as u64;
-            // let _ = vocab.insert(new_group.clone(), new_id);
-            let new_id = vocab.get(&new_group).copied().unwrap_or_else(|| {
-                let new_id = vocab.len() as u64;
-                let _ = vocab.insert(new_group.clone(), new_id);
-                new_id
-            });
-            let dbg_new_group = str::from_utf8(&new_group).unwrap_or("...");
-            pop_timing.t_build_new_group += t.elapsed();
-
-            if candidate.cnt == 0 {
-                eprintln!("skip cuz cnt == 0");
-                continue;
-            }
-
-            dbg_cnt += 1;
-            if dbg_cnt < 50 {
-                eprintln!("inserted <{}> as {}", dbg_new_group, new_id);
-            }
-
-            // println!("insert new word: |{dbg_new_group}|");
-            let t = Instant::now();
-            let _ = rev_vocab.insert(new_id, new_group);
-            pop_timing.t_rev_vocab_insert += t.elapsed();
-            // maps vocab_id_pair to GroupPairState
-
-            let preindices_t0 = Instant::now();
-            for (pretoken_id, x_idx) in &state.pre_indices {
-                let (pretoken_id, x_idx) = (*pretoken_id, *x_idx);
-                let t = Instant::now();
-                let y_idx = x_idx + x.len() as i16;
-                let pretoken = pretoken_state
-                    .get_mut(&pretoken_id)
-                    .ok_or(invalid(format!("keys")))?;
-                pop_timing.t_get_pretoken += t.elapsed();
-                // vocab_id_at must exist
-                // if pretoken.vocab_id_at.get(x_idx as usize).is_none()
-                //     || pretoken.vocab_id_at.get(y_idx as usize).is_none()
-                // {
-                //     continue;
-                // }
-                let t = Instant::now();
-                if let (Some(actual_x_id_here), Some(actual_y_id_here)) = (
-                    pretoken
-                        .vocab_id_at
-                        .get(x_idx as usize)
-                        .ok_or(InvalidInput)?,
-                    pretoken
-                        .vocab_id_at
-                        .get(y_idx as usize)
-                        .ok_or(InvalidInput)?,
-                ) {
-                    if *actual_x_id_here != x_id || *actual_y_id_here != y_id {
-                        pop_timing.t_validate_pair += t.elapsed();
-                        continue;
-                    }
-                } else {
-                    pop_timing.t_validate_pair += t.elapsed();
-                    continue;
-                }
-                pop_timing.t_validate_pair += t.elapsed();
-
-                let t = Instant::now();
-                let pre_x_idx = *pretoken
-                    .pre
-                    .get(x_idx as usize)
-                    .ok_or(invalid(format!("pre_x_idx {x_idx}")))?;
-                let dbg1 = str::from_utf8(&pretoken.bytes).unwrap_or("...");
-                let dbg2 = str::from_utf8(&x).unwrap_or("...");
-                let nxt_y_idx = *pretoken.nxt.get(y_idx as usize).ok_or(invalid(format!(
-                    "nxt_y_idx {}|{}|{}",
-                    x_idx as usize + x.len(),
-                    dbg1,
-                    dbg2,
-                )))?;
-                pop_timing.t_neighbor_lookup += t.elapsed();
-
-                fn add_new_group_pair(
-                    vocab_ids: (u64, u64),
-                    pretoken_id: u64,
-                    pretoken_cnt: u64,
-                    idx_in_pretoken: i16,
-                    state: &mut HashMap<(u64, u64), GroupPairState, FixedHasher>,
-                    heap: &mut BinaryHeap<GroupPairCandidate>,
-                ) {
-                    let state = state.entry(vocab_ids).or_insert_with(|| GroupPairState {
-                        cnt: 0,
-                        pre_indices: HashSet::with_hasher(hasher()),
-                        latest_ver: 0,
-                    });
-                    let _ = state.pre_indices.insert((pretoken_id, idx_in_pretoken));
-                    state.cnt += pretoken_cnt;
-                    state.latest_ver += 1;
-                    let _ = heap.push(GroupPairCandidate {
-                        cnt: state.cnt,
-                        ver: state.latest_ver,
-                        vocab_ids: vocab_ids,
-                    });
-                }
-
-                if pre_x_idx > -1 {
-                    let t = Instant::now();
-                    // |      |     |
-                    // pre_x--x--y--nxt_y
-                    let pre_id = pretoken
-                        .vocab_id_at
-                        .get(pre_x_idx as usize)
-                        .ok_or(InvalidInput)?
-                        .ok_or(invalid(format!(concat!(
-                            line!(),
-                            ":vocab_id_at[] exists and is None",
-                        ))))?;
-                    let new_vocab_id_pair = (pre_id, new_id);
-                    let dbg_pre = view(rev_vocab.get(&pre_id).ok_or(InvalidInput)?);
-                    let dbg_new = view(rev_vocab.get(&new_id).ok_or(InvalidInput)?);
-                    // add (pre_x, xy)
-                    add_new_group_pair(
-                        new_vocab_id_pair,
-                        pretoken_id,
-                        pretoken.cnt,
-                        pre_x_idx,
-                        &mut group_pair_state,
-                        &mut group_pair_heap,
-                    );
-                    pop_timing.t_add_pair_updates += t.elapsed();
-                }
-                if nxt_y_idx < pretoken.bytes.len() as i16 {
-                    let t = Instant::now();
-                    // |      |     |
-                    // pre_x--x--y--nxt_y
-                    *pretoken
-                        .pre
-                        .get_mut(nxt_y_idx as usize)
-                        .ok_or(InvalidInput)? = pre_x_idx;
-                    let nxt_id = pretoken
-                        .vocab_id_at
-                        .get(nxt_y_idx as usize)
-                        .ok_or(InvalidInput)?
-                        .ok_or(invalid(format!(concat!(
-                            line!(),
-                            ":vocab_id_at[] exists and is None",
-                        ))))?;
-                    // add (xy, nxt_y)
-                    let new_vocab_id_pair = (new_id, nxt_id);
-                    add_new_group_pair(
-                        new_vocab_id_pair,
-                        pretoken_id,
-                        pretoken.cnt,
-                        x_idx,
-                        &mut group_pair_state,
-                        &mut group_pair_heap,
-                    );
-
-                    // maintain pretoken
-                    *pretoken
-                        .pre
-                        .get_mut(nxt_y_idx as usize)
-                        .ok_or(InvalidInput)? = x_idx;
-                    pop_timing.t_add_pair_updates += t.elapsed();
-                }
-                let t = Instant::now();
-                *pretoken
-                    .vocab_id_at
-                    .get_mut(x_idx as usize)
-                    .ok_or(InvalidInput)? = Some(new_id);
-                *pretoken
-                    .vocab_id_at
-                    .get_mut(y_idx as usize)
-                    .ok_or(InvalidInput)? = None;
-                *pretoken.nxt.get_mut(x_idx as usize).ok_or(InvalidInput)? = nxt_y_idx;
-                pop_timing.t_apply_pretoken += t.elapsed();
-
-                // let dbg_pretoken = str::from_utf8(&pretoken.bytes).unwrap_or("...");
-                // println!("vocab_id_at[{}] = {:?}", dbg_pretoken, pretoken.vocab_id_at);
-                // println!(
-                //     "vocab_id_at[{}] = {:?}",
-                //     dbg_pretoken,
-                //     pretoken
-                //         .vocab_id_at
-                //         .iter()
-                //         .map(|v| if let Some(v) = v {
-                //             view(rev_vocab.get(v).unwrap())
-                //         } else {
-                //             "".to_string()
-                //         })
-                //         .collect::<Vec<_>>()
-                // );
-            }
-            pop_timing.t_preindices_total += preindices_t0.elapsed();
-        }
-        // for key in vocab.keys().skip(0).take(50) {
-        //     let word = str::from_utf8(key).unwrap_or("...");
-        //     println!("<{word}>");
-        // }
-        // for m in re.find_iter(t.as_str()) {
-        //     if let Ok(m) = m
-        //         && !special_tokens.contains(&m.as_str().trim())
-        //     {
-        //         let bytes = m.as_str().as_bytes();
-        //         for (x, y) in bytes.windows(2).map(|w| (w[0], w[1])) {}
-        //     }
-        // }
-        pop_timing.emit(pop_wall_start.elapsed());
+        let (vocab, merges) = train(
+            "data/TinyStoriesV2-GPT4-train.txt",
+            10000,
+            vec!["<|endoftext|>".to_string()],
+        )?;
+        eprintln!("vocab size: {}", vocab.len());
+        eprintln!("merges size: {}", merges.len());
         Ok(())
     }
 }

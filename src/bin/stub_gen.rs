@@ -1,8 +1,9 @@
-#[cfg(feature = "pyo3-extension")]
+#![cfg(feature = "pyo3-extension")]
+
 use pyo3_stub_gen::Result;
 use std::path::PathBuf;
 
-fn main() -> Result<(), std::io::Error> {
+fn main() -> Result<()> {
     #[cfg(feature = "pyo3-extension")]
     {
         let mut stub = cs336_basics::stub_info()?;
