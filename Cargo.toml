@@ -21,3 +21,8 @@ pyo3-extension = ["pyo3", "pyo3-stub-gen"]
 [dev-dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[[bin]]
+name = "stub_gen"
+path = "src/bin/stub_gen.rs"
+required-features = ["pyo3-extension"]
