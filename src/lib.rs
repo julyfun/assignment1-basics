@@ -50,9 +50,6 @@ mod core {
     const MINI_CHUNK_SIZE: usize = 1 << 12;
     pub const PAT: &str =
         r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|[^\S\r\n]|[\r\n]+"#;
-    // pub const PAT: &str =
-    //     r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|(?:\r?\n)+|[^\S\r\n]+"#;
-    // pub const PAT: &str = r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|(?:\r?\n){2,}|\r?\n|[^\S\r\n]+"#;
 
     pub fn invalid(s: String) -> std::io::Error {
         std::io::Error::new(InvalidInput, s)
@@ -178,15 +175,6 @@ mod core {
         Ok(boundaries)
     }
 
-    // fn vocab_pair_string(
-    //     vocab: &HashMap<u64, Vec<u8>, FixedHasher>,
-    //     vocab_ids: (u64, u64),
-    // ) -> Result<Vec<u8>, std::io::Error> {
-    //     let x = vocab.get(&vocab_ids.0).ok_or(InvalidInput)?.clone();
-    //     let y = vocab.get(&vocab_ids.1).ok_or(InvalidInput)?.clone();
-    //     Ok([x.clone(), y.clone()].concat())
-    // }
-
     pub fn train(
         path: &str,
         vocab_size: usize,
@@ -251,7 +239,6 @@ mod core {
                             if let Ok(m) = m
                                 && !special_tokens.contains(&m.as_str().trim().to_string())
                             {
-                                // println!("match <{}>", m.as_str());
                                 let entry =
                                     local.entry(m.as_str().as_bytes().to_vec()).or_insert(0);
                                 *entry += 1;
@@ -321,7 +308,6 @@ mod core {
         };
         // start merging!
         // 若在 heap 中，则 (id_x, id_y) 必然不在 vocab 中
-        let mut dbg_cnt = 0;
         eprintln!("[stage.merge]");
         let mut merges: Vec<(Vec<u8>, Vec<u8>)> = vec![];
         while rev_vocab.len() < vocab_size {
@@ -361,7 +347,6 @@ mod core {
             } else {
                 let _ = merges.push((x.clone(), y.clone()));
             }
-            // maps vocab_id_pair to GroupPairState
 
             for (pretoken_id, x_idx) in &state.pre_indices {
                 let (pretoken_id, x_idx) = (*pretoken_id, *x_idx);
@@ -369,12 +354,6 @@ mod core {
                 let pretoken = pretoken_state
                     .get_mut(&pretoken_id)
                     .ok_or(invalid(format!("keys")))?;
-                // vocab_id_at must exist
-                // if pretoken.vocab_id_at.get(x_idx as usize).is_none()
-                //     || pretoken.vocab_id_at.get(y_idx as usize).is_none()
-                // {
-                //     continue;
-                // }
                 if let (Some(actual_x_id_here), Some(actual_y_id_here)) = (
                     pretoken
                         .vocab_id_at
@@ -525,22 +504,6 @@ mod core {
                     .get_mut(y_idx as usize)
                     .ok_or(InvalidInput)? = None;
                 *pretoken.nxt.get_mut(x_idx as usize).ok_or(InvalidInput)? = nxt_y_idx;
-
-                // let dbg_pretoken = str::from_utf8(&pretoken.bytes).unwrap_or("...");
-                // println!("vocab_id_at[{}] = {:?}", dbg_pretoken, pretoken.vocab_id_at);
-                // println!(
-                //     "vocab_id_at[{}] = {:?}",
-                //     dbg_pretoken,
-                //     pretoken
-                //         .vocab_id_at
-                //         .iter()
-                //         .map(|v| if let Some(v) = v {
-                //             view(rev_vocab.get(v).unwrap())
-                //         } else {
-                //             "".to_string()
-                //         })
-                //         .collect::<Vec<_>>()
-                // );
             }
         }
         Ok((vocab, merges))
