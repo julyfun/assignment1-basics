@@ -6,12 +6,8 @@ mod cs336_basics {
     use super::core;
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
-    use pyo3::types::{IntoPyDict, PyAny, PyDict};
     use pyo3_stub_gen::derive::gen_stub_pyfunction;
     use std::collections::HashMap;
-    use std::fs::File;
-    use std::io::ErrorKind::InvalidInput;
-    use std::io::{BufReader, Read, Seek, SeekFrom};
 
     #[gen_stub_pyfunction]
     #[pyfunction]
@@ -23,7 +19,10 @@ mod cs336_basics {
     /// This is a test comment.
     #[gen_stub_pyfunction]
     #[pyfunction]
-    #[pyo3(signature = (path, vocab_size, special_tokens), text_signature = "(path: str, vocab_size: int, special_tokens: list[str]) -> (dict[int, bytes], list[tuple[bytes, bytes]])")]
+    #[gen_stub(override_return_type(
+        type_repr = "tuple[dict[int, bytes], list[tuple[bytes, bytes]]]"
+    ))]
+    #[pyo3(signature = (path, vocab_size, special_tokens))]
     fn train(
         path: &str,
         vocab_size: usize,
@@ -45,12 +44,15 @@ mod core {
     use std::fs::File;
     use std::hash::BuildHasherDefault;
     use std::io::ErrorKind::InvalidInput;
-    use std::io::{BufReader, Error, Read, Seek, SeekFrom};
+    use std::io::{BufReader, Read, Seek, SeekFrom};
 
-    pub const NUM_PROCESSES: usize = 32;
-    pub const MINI_CHUNK_SIZE: usize = 1 << 12;
+    const NUM_PROCESSES: usize = 32;
+    const MINI_CHUNK_SIZE: usize = 1 << 12;
     pub const PAT: &str =
-        r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#;
+        r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|[^\S\r\n]|[\r\n]+"#;
+    // pub const PAT: &str =
+    //     r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|(?:\r?\n)+|[^\S\r\n]+"#;
+    // pub const PAT: &str = r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|(?:\r?\n){2,}|\r?\n|[^\S\r\n]+"#;
 
     pub fn invalid(s: String) -> std::io::Error {
         std::io::Error::new(InvalidInput, s)
@@ -106,6 +108,8 @@ mod core {
         pub ver: u64,
         pub cnt: u64,
         pub vocab_ids: (u64, u64),
+        pub left: Vec<u8>,
+        pub right: Vec<u8>,
     }
     use std::cmp::Ordering;
     impl PartialOrd for GroupPairCandidate {
@@ -118,6 +122,14 @@ mod core {
             if self.cnt < other.cnt {
                 Ordering::Less
             } else if self.cnt > other.cnt {
+                Ordering::Greater
+            } else if self.left < other.left {
+                Ordering::Less
+            } else if self.left > other.left {
+                Ordering::Greater
+            } else if self.right < other.right {
+                Ordering::Less
+            } else if self.right > other.right {
                 Ordering::Greater
             } else {
                 Ordering::Equal
@@ -145,7 +157,7 @@ mod core {
         // slightly longer to make sure no end_token is skipped
         let buf_size = MINI_CHUNK_SIZE + end_token.len() - 1;
         let mut buffer = vec![0u8; buf_size];
-        for b in &mut boundaries {
+        for b in &mut boundaries.iter_mut().skip(1) {
             let mut pos = *b;
             let _ = file.seek(SeekFrom::Start(pos as u64))?;
             loop {
@@ -166,6 +178,15 @@ mod core {
         Ok(boundaries)
     }
 
+    // fn vocab_pair_string(
+    //     vocab: &HashMap<u64, Vec<u8>, FixedHasher>,
+    //     vocab_ids: (u64, u64),
+    // ) -> Result<Vec<u8>, std::io::Error> {
+    //     let x = vocab.get(&vocab_ids.0).ok_or(InvalidInput)?.clone();
+    //     let y = vocab.get(&vocab_ids.1).ok_or(InvalidInput)?.clone();
+    //     Ok([x.clone(), y.clone()].concat())
+    // }
+
     pub fn train(
         path: &str,
         vocab_size: usize,
@@ -178,7 +199,9 @@ mod core {
             .iter()
             .map(|x| escape(x).to_string())
             .collect();
-        let pat = " ?(?:".to_string() + special_tokens1.join("|").as_str() + ")|" + PAT;
+        let pat = " ?(?:".to_string() + special_tokens1.join("|").as_str() + ")(?:\\s)?|" + PAT;
+        // let pat = " ?(?:".to_string() + special_tokens1.join("|").as_str() + ")|" + PAT;
+        eprintln!("pat: {pat}");
         // let t = std::fs::read_to_string("data/TinyStoriesV2-GPT4-train.txt")?;
         let file = File::open(path)?;
         let mut boundary_reader = BufReader::new(file);
@@ -228,6 +251,7 @@ mod core {
                             if let Ok(m) = m
                                 && !special_tokens.contains(&m.as_str().trim().to_string())
                             {
+                                // println!("match <{}>", m.as_str());
                                 let entry =
                                     local.entry(m.as_str().as_bytes().to_vec()).or_insert(0);
                                 *entry += 1;
@@ -289,19 +313,14 @@ mod core {
                     ver: state.latest_ver,
                     cnt: state.cnt,
                     vocab_ids: *vocab_ids,
+                    left: vocab.get(&vocab_ids.0).ok_or(InvalidInput)?.clone(),
+                    right: vocab.get(&vocab_ids.1).ok_or(InvalidInput)?.clone(),
                 });
             }
             (heap, group_pair_state)
         };
         // start merging!
         // 若在 heap 中，则 (id_x, id_y) 必然不在 vocab 中
-        // vocab_id_pair: (u64, u64),
-        // cnt: u64,
-        // pre_indices: Vec<(u64, i16)>,
-        // let mut lazy_deletions =
-        //     HashMap::<(u64, u64), HashSet<(u64, i16), _>, _>::with_hasher(hasher());
-        // let mut group_pair_latest_version = HashMap::<(u64, u64), u64, _>::with_hasher(hasher());
-
         let mut dbg_cnt = 0;
         eprintln!("[stage.merge]");
         let mut merges: Vec<(Vec<u8>, Vec<u8>)> = vec![];
@@ -329,22 +348,19 @@ mod core {
                 let _ = rev_vocab.insert(new_group.clone(), new_id);
                 new_id
             });
-            let dbg_new_group = str::from_utf8(&new_group).unwrap_or("...");
 
             if candidate.cnt == 0 {
                 eprintln!("skip cuz cnt == 0");
                 continue;
             }
 
-            dbg_cnt += 1;
-            if dbg_cnt < 50 {
-                eprintln!("inserted <{}> as {}", dbg_new_group, new_id);
-            }
-
-            let _ = merges.push((x.clone(), y.clone()));
-
             // println!("insert new word: |{dbg_new_group}|");
-            let _ = vocab.insert(new_id, new_group);
+            if let Some(_) = vocab.insert(new_id, new_group) {
+                eprintln!("skip: duplicate");
+                continue;
+            } else {
+                let _ = merges.push((x.clone(), y.clone()));
+            }
             // maps vocab_id_pair to GroupPairState
 
             for (pretoken_id, x_idx) in &state.pre_indices {
@@ -389,33 +405,47 @@ mod core {
                     dbg2,
                 )))?;
 
-                fn add_new_group_pair(
+                fn modify_group_pair(
+                    state: &mut HashMap<(u64, u64), GroupPairState, FixedHasher>,
+                    heap: &mut BinaryHeap<GroupPairCandidate>,
+                    vocab: &HashMap<u64, Vec<u8>, FixedHasher>,
                     vocab_ids: (u64, u64),
                     pretoken_id: u64,
                     pretoken_cnt: u64,
                     idx_in_pretoken: i16,
-                    state: &mut HashMap<(u64, u64), GroupPairState, FixedHasher>,
-                    heap: &mut BinaryHeap<GroupPairCandidate>,
-                ) {
+                    add: bool,
+                ) -> Result<(), std::io::Error> {
                     let state = state.entry(vocab_ids).or_insert_with(|| GroupPairState {
                         cnt: 0,
                         pre_indices: HashSet::with_hasher(hasher()),
                         latest_ver: 0,
                     });
-                    let _ = state.pre_indices.insert((pretoken_id, idx_in_pretoken));
-                    state.cnt += pretoken_cnt;
+                    if add {
+                        let _ = state.pre_indices.insert((pretoken_id, idx_in_pretoken));
+                        state.cnt += pretoken_cnt;
+                    } else {
+                        state
+                            .pre_indices
+                            .remove(&(pretoken_id, idx_in_pretoken))
+                            .then_some(())
+                            .ok_or_else(|| invalid("remove failed".to_string()))?;
+                        state.cnt -= pretoken_cnt;
+                    }
                     state.latest_ver += 1;
                     let _ = heap.push(GroupPairCandidate {
                         cnt: state.cnt,
                         ver: state.latest_ver,
                         vocab_ids: vocab_ids,
+                        left: vocab.get(&vocab_ids.0).ok_or(InvalidInput)?.clone(),
+                        right: vocab.get(&vocab_ids.1).ok_or(InvalidInput)?.clone(),
                     });
+                    Ok(())
                 }
 
                 if pre_x_idx > -1 {
                     // |      |     |
                     // pre_x--x--y--nxt_y
-                    let pre_id = pretoken
+                    let pre_x_id = pretoken
                         .vocab_id_at
                         .get(pre_x_idx as usize)
                         .ok_or(InvalidInput)?
@@ -423,27 +453,33 @@ mod core {
                             line!(),
                             ":vocab_id_at[] exists and is None",
                         ))))?;
-                    let new_vocab_id_pair = (pre_id, new_id);
-                    let dbg_pre = view(vocab.get(&pre_id).ok_or(InvalidInput)?);
-                    let dbg_new = view(vocab.get(&new_id).ok_or(InvalidInput)?);
+                    let new_vocab_id_pair = (pre_x_id, new_id);
                     // add (pre_x, xy)
-                    add_new_group_pair(
+                    modify_group_pair(
+                        &mut group_pair_state,
+                        &mut group_pair_heap,
+                        &vocab,
                         new_vocab_id_pair,
                         pretoken_id,
                         pretoken.cnt,
                         pre_x_idx,
+                        true,
+                    )?;
+                    modify_group_pair(
                         &mut group_pair_state,
                         &mut group_pair_heap,
-                    );
+                        &vocab,
+                        (pre_x_id, x_id),
+                        pretoken_id,
+                        pretoken.cnt,
+                        pre_x_idx,
+                        false,
+                    )?;
                 }
                 if nxt_y_idx < pretoken.bytes.len() as i16 {
                     // |      |     |
                     // pre_x--x--y--nxt_y
-                    *pretoken
-                        .pre
-                        .get_mut(nxt_y_idx as usize)
-                        .ok_or(InvalidInput)? = pre_x_idx;
-                    let nxt_id = pretoken
+                    let nxt_y_id = pretoken
                         .vocab_id_at
                         .get(nxt_y_idx as usize)
                         .ok_or(InvalidInput)?
@@ -452,15 +488,27 @@ mod core {
                             ":vocab_id_at[] exists and is None",
                         ))))?;
                     // add (xy, nxt_y)
-                    let new_vocab_id_pair = (new_id, nxt_id);
-                    add_new_group_pair(
+                    let new_vocab_id_pair = (new_id, nxt_y_id);
+                    modify_group_pair(
+                        &mut group_pair_state,
+                        &mut group_pair_heap,
+                        &vocab,
                         new_vocab_id_pair,
                         pretoken_id,
                         pretoken.cnt,
                         x_idx,
+                        true,
+                    )?;
+                    modify_group_pair(
                         &mut group_pair_state,
                         &mut group_pair_heap,
-                    );
+                        &vocab,
+                        (y_id, nxt_y_id),
+                        pretoken_id,
+                        pretoken.cnt,
+                        y_idx,
+                        false,
+                    )?;
 
                     // maintain pretoken
                     *pretoken
@@ -496,10 +544,6 @@ mod core {
             }
         }
         Ok((vocab, merges))
-    }
-
-    fn view(a: &Vec<u8>) -> String {
-        str::from_utf8(a).unwrap_or("...").to_string()
     }
 
     fn hasher() -> BuildHasherDefault<SipHasher13> {
@@ -568,7 +612,7 @@ mod tests {
             .iter()
             .map(|x| escape(x).to_string())
             .collect();
-        let pat = " ?(?:".to_string() + special_tokens1.join("|").as_str() + ")|" + PAT;
+        let pat = "(".to_string() + special_tokens1.join("|").as_str() + ")|" + PAT;
         let t = "hello, who are you? <|endoftext|> whoami233 who";
         let re = Regex::new(pat.as_str())?;
         for m in re.find_iter(t) {

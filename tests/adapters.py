@@ -11,6 +11,7 @@ from torch import Tensor
 
 from cs336_basics import cs336_basics
 
+
 def run_linear(
     d_in: int,
     d_out: int,
@@ -591,5 +592,6 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     path = os.fspath(input_path)
-    cs336_basics.train(
-        path, vocab_size, special_tokens)
+    v, m = cs336_basics.train(path, vocab_size, special_tokens)
+    print(f"run_train_bpe, v: {len(v)}, m: {len(m)}")
+    return v, m
