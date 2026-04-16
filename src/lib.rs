@@ -8,8 +8,11 @@ mod cs336_basics {
     use super::core;
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
+    use pyo3::types::{PyAny, PyType};
     use pyo3_stub_gen::derive::gen_stub_pyfunction;
+    use serde_json::Value;
     use std::collections::HashMap;
+    use std::fs;
 
     #[gen_stub_pyfunction]
     #[pyfunction]
@@ -36,6 +39,158 @@ mod cs336_basics {
                 (vocab_common_hash, merges)
             })
             .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    #[pyclass]
+    struct Tokenizer {
+        inner: core::TokenizerCore,
+    }
+
+    fn parse_vocab_json_value(
+        v: &Value,
+    ) -> Result<HashMap<u64, Vec<u8>>, std::io::Error> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| core::invalid("vocab should be a JSON object".to_string()))?;
+        let mut vocab = HashMap::new();
+        for (k, v) in obj {
+            let id = k
+                .parse::<u64>()
+                .map_err(|_| core::invalid("vocab key should be u64".to_string()))?;
+            let arr = v.as_array().ok_or_else(|| {
+                core::invalid("vocab value should be a list of bytes".to_string())
+            })?;
+            let mut bytes = Vec::with_capacity(arr.len());
+            for x in arr {
+                let b = x
+                    .as_u64()
+                    .ok_or_else(|| core::invalid("byte should be integer".to_string()))?;
+                if b > 255 {
+                    return Err(core::invalid("byte value should be <= 255".to_string()));
+                }
+                bytes.push(b as u8);
+            }
+            let _ = vocab.insert(id, bytes);
+        }
+        Ok(vocab)
+    }
+
+    fn parse_merges_json_value(v: &Value) -> Result<Vec<(Vec<u8>, Vec<u8>)>, std::io::Error> {
+        let arr = v
+            .as_array()
+            .ok_or_else(|| core::invalid("merges should be a list".to_string()))?;
+        let mut merges = Vec::with_capacity(arr.len());
+        for item in arr {
+            let pair = item
+                .as_array()
+                .ok_or_else(|| core::invalid("merge item should be a pair".to_string()))?;
+            if pair.len() != 2 {
+                return Err(core::invalid("merge pair length should be 2".to_string()));
+            }
+            let parse_bytes = |x: &Value| -> Result<Vec<u8>, std::io::Error> {
+                let bs = x
+                    .as_array()
+                    .ok_or_else(|| core::invalid("merge token should be byte list".to_string()))?;
+                let mut out = Vec::with_capacity(bs.len());
+                for b in bs {
+                    let b = b
+                        .as_u64()
+                        .ok_or_else(|| core::invalid("merge byte should be integer".to_string()))?;
+                    if b > 255 {
+                        return Err(core::invalid("merge byte should be <= 255".to_string()));
+                    }
+                    out.push(b as u8);
+                }
+                Ok(out)
+            };
+            merges.push((parse_bytes(&pair[0])?, parse_bytes(&pair[1])?));
+        }
+        Ok(merges)
+    }
+
+    fn parse_vocab_merges_from_files(
+        vocab_filepath: &str,
+        merges_filepath: &str,
+    ) -> Result<(HashMap<u64, Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>), std::io::Error> {
+        let vocab_content = fs::read_to_string(vocab_filepath)?;
+        let vocab_json: Value =
+            serde_json::from_str(vocab_content.as_str()).map_err(|e| core::invalid(e.to_string()))?;
+
+        if vocab_json.get("vocab").is_some() && vocab_json.get("merges").is_some() {
+            let vocab = parse_vocab_json_value(
+                vocab_json
+                    .get("vocab")
+                    .ok_or_else(|| core::invalid("missing vocab".to_string()))?,
+            )?;
+            let merges = parse_merges_json_value(
+                vocab_json
+                    .get("merges")
+                    .ok_or_else(|| core::invalid("missing merges".to_string()))?,
+            )?;
+            return Ok((vocab, merges));
+        }
+
+        let vocab = parse_vocab_json_value(&vocab_json)?;
+        let merges_content = fs::read_to_string(merges_filepath)?;
+        let merges_json: Value = serde_json::from_str(merges_content.as_str())
+            .map_err(|e| core::invalid(e.to_string()))?;
+        let merges = parse_merges_json_value(&merges_json)?;
+        Ok((vocab, merges))
+    }
+
+    #[pymethods]
+    impl Tokenizer {
+        #[new]
+        #[pyo3(signature = (vocab, merges, special_tokens=None))]
+        fn new(
+            vocab: HashMap<u64, Vec<u8>>,
+            merges: Vec<(Vec<u8>, Vec<u8>)>,
+            special_tokens: Option<Vec<String>>,
+        ) -> PyResult<Self> {
+            let mut vocab_fixed = HashMap::with_hasher(core::FixedHasher::default());
+            for (k, v) in vocab {
+                let _ = vocab_fixed.insert(k, v);
+            }
+            let inner = core::TokenizerCore::new(vocab_fixed, merges, special_tokens)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok(Self { inner })
+        }
+
+        #[classmethod]
+        #[pyo3(signature = (vocab_filepath, merges_filepath, special_tokens=None))]
+        fn from_files(
+            _cls: &Bound<'_, PyType>,
+            vocab_filepath: &str,
+            merges_filepath: &str,
+            special_tokens: Option<Vec<String>>,
+        ) -> PyResult<Self> {
+            let (vocab, merges) = parse_vocab_merges_from_files(vocab_filepath, merges_filepath)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Self::new(vocab, merges, special_tokens)
+        }
+
+        fn encode(&self, text: &str) -> PyResult<Vec<u64>> {
+            self.inner
+                .encode(text)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        }
+
+        fn encode_iterable(&self, iterable: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+            let mut chunks = Vec::<String>::new();
+            let iter = iterable.try_iter()?;
+            for item in iter {
+                chunks.push(item?.extract::<String>()?);
+            }
+            self.inner
+                .encode_iterable(chunks)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        }
+
+        fn decode(&self, ids: Vec<u64>) -> PyResult<String> {
+            self.inner
+                .decode(ids.as_slice())
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        }
     }
 }
 

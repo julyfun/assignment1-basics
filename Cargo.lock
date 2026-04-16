@@ -128,6 +128,7 @@ dependencies = [
  "pyo3-stub-gen",
  "rayon",
  "regex",
+ "serde_json",
  "siphasher",
  "tracing",
  "tracing-subscriber",

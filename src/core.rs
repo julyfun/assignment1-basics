@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 mod dec;
+#[allow(unused_imports)]
+pub use dec::TokenizerCore;
 
 use siphasher::sip::SipHasher13;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -12,7 +14,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 const NUM_PROCESSES: usize = 32;
 const MINI_CHUNK_SIZE: usize = 1 << 12;
 pub const PAT: &str =
-    r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|[^\S\r\n]|[\r\n]+"#;
+    r#"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"#;
 
 pub fn invalid(s: String) -> std::io::Error {
     std::io::Error::new(InvalidInput, s)
