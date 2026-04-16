@@ -1,6 +1,6 @@
 import torch
-from torch import nn
-
+from torch import nn, Tensor
+from jaxtyping import Float
 
 class Linear(nn.Module):
     def __init__(
@@ -11,13 +11,12 @@ class Linear(nn.Module):
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        self.W = torch.empty(out_features, in_features, dtype=dtype)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype)).to(device)
         std = (2 / (in_features + out_features)) ** 0.5
-        nn.init.trunc_normal_(self.W, std=std, a=-3 * std, b=3 * std)
-        self.W.to(device)
+        nn.init.trunc_normal_(self.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.W.T
+        return x @ self.weight.T
         
 class Embedding(nn.Module):
     def __init__(
@@ -28,10 +27,8 @@ class Embedding(nn.Module):
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        W = torch.empty(num_embeddings, embedding_dim, dtype=dtype)
-        nn.init.trunc_normal_(W, std=1, a=-3, b=3)
-        self.emb = nn.Parameter(W)
-        self.emb.to(device)
+        self.emb = nn.Parameter(torch.empty(num_embeddings, embedding_dim, dtype=dtype)).to(device)
+        nn.init.trunc_normal_(self.emb, std=1, a=-3, b=3)
         
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.emb[token_ids, :]
@@ -54,4 +51,27 @@ class RMSNorm(nn.Module):
         x = x.to(torch.float32)
         rms = torch.sqrt(self.eps + 1 / self.d_model * torch.sum(torch.square(x), dim=-1, keepdim=True))
         return (x / rms * self.g).to(in_dtype)
+        
+def silu(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.sigmoid(x)
+    
+        
+class SwiGLU(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        # may use self.d_ff = max(1, int(d_model * 8 / 3 / 64 + 0.5)) * 64
+        self.d_ff = d_ff
+        self.W1 = Linear(d_model, d_ff, device, dtype)
+        self.W2 = Linear(d_ff, d_model, device, dtype)
+        self.W3 = Linear(d_model, d_ff, device, dtype)
+       
+    def forward(self, x: torch.Tensor) -> Float[Tensor, "... d_model"]:
+        return self.W2(silu(self.W1(x)) * (self.W3(x)))
         

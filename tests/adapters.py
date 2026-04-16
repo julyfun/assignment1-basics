@@ -34,7 +34,7 @@ def run_linear(
     """
 
     model = nn.Linear(d_in, d_out)
-    model.W = weights
+    model.weight.data = weights
     return model(in_features)
 
 def run_embedding(
@@ -92,7 +92,14 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    model = nn.SwiGLU(d_model, d_ff)
+    state_dict = {
+        "W1.weight": w1_weight,
+        "W2.weight": w2_weight,
+        "W3.weight": w3_weight,
+    }
+    model.load_state_dict(state_dict)
+    return model(in_features)
 
 
 def run_scaled_dot_product_attention(
