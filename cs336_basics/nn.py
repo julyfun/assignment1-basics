@@ -1,6 +1,6 @@
 import torch
 from torch import nn, Tensor
-from jaxtyping import Float
+from jaxtyping import Float, Bool
 from typing_extensions import override
 
 class Linear(nn.Module):
@@ -111,4 +111,17 @@ class RotaryPositionalEmbedding(nn.Module):
 def softmax(x: Tensor, dim: int) -> Tensor:
     e = torch.exp(x - torch.max(x, dim=dim, keepdim=True).values)
     return e / torch.sum(e, dim=dim, keepdim=True)
+    
+def scaled_dot_product_attention(
+    q: Float[Tensor, "b ... seq_len d_k"],
+    k: Float[Tensor, "b ... seq_len d_k"],
+    v: Float[Tensor, "b ... seq_len d_v"],
+    mask: Bool[Tensor, "b ... seq_len seq_len"] | None,
+) -> Float[Tensor, "b ... seq_len d_v"]:
+    d_k = q.shape[-1]
+    attn = q @ k.mT / d_k ** 0.5 # [b, ..., q_len, k_len]
+    if mask is not None:
+        attn[~mask] -= float('inf')
+    # v: k_len, d_v
+    return softmax(attn, dim=-1) @ v
     
