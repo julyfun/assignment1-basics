@@ -1,6 +1,7 @@
 import torch
 from torch import nn, Tensor
 from jaxtyping import Float
+from typing_extensions import override
 
 class Linear(nn.Module):
     def __init__(
@@ -15,6 +16,7 @@ class Linear(nn.Module):
         std = (2 / (in_features + out_features)) ** 0.5
         nn.init.trunc_normal_(self.weight, std=std, a=-3 * std, b=3 * std)
 
+    @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.weight.T
         
@@ -75,3 +77,34 @@ class SwiGLU(nn.Module):
     def forward(self, x: torch.Tensor) -> Float[Tensor, "... d_model"]:
         return self.W2(silu(self.W1(x)) * (self.W3(x)))
         
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(
+        self,
+        theta: float,
+        d_k: int,
+        max_seq_len: int,
+        device: torch.device | None = None
+    ):
+        super().__init__()
+        # self.cos = torch.empty(max_seq_len, d_k)
+        thetas = torch.tensor(
+            [[i / theta ** ((2 * k - 2) / d_k) for k in range(1, d_k // 2 + 1)]
+            for i in range(max_seq_len)]
+        )
+        cos = torch.cos(thetas)
+        sin = torch.sin(thetas)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+    
+    def forward(self, x: Tensor, token_positions: Tensor) -> Tensor:
+        """
+        x: (..., seq_len, d_k), return same shape
+        token_positions:  (..., seq_len) 
+        """
+        ...
+        cos = self.cos[token_positions]
+        sin = self.sin[token_positions]
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).view_as(x)
+ 

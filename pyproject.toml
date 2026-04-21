@@ -53,3 +53,8 @@ extend-select = ["UP"]
 ignore = [
     "F722"
 ]
+
+[tool.basedpyright]
+reportPrivateImportUsage = false
+reportAny = false
+reportUnannotatedClassAttribute = false
