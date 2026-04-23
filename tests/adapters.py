@@ -57,7 +57,7 @@ def run_embedding(
     """
     model = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
     state_dict = {
-        "emb": torch.nn.Parameter(weights)
+        "weight": torch.nn.Parameter(weights)
     }
     model.load_state_dict(state_dict)
     return model(token_ids)
@@ -211,6 +211,7 @@ def run_multihead_self_attention_with_rope(
         "output_proj.weight": o_proj_weight,
     }
     _ = model.load_state_dict(state_dict)
+    token_positions = torch.arange(in_features.shape[-2]).expand(*in_features.shape[:-1])
     return model(in_features, token_positions, rope)
 
 
@@ -315,7 +316,9 @@ def run_transformer_block(
         max_seq_len,
     )
     _ = model.load_state_dict(weights)
-    return model(in_features, None)
+    
+    token_positions = torch.arange(in_features.shape[-2]).expand(*in_features.shape[:-1])
+    return model(in_features, token_positions)
 
 
 def run_transformer_lm(
@@ -397,8 +400,19 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
-
+    llm = nn.TransformerLM(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        vocab_size=vocab_size,
+        context_length=context_length,
+        num_layers=num_layers,
+    )
+    missing, unx = llm.load_state_dict(weights)
+    assert len(missing) == 0 and len(unx) == 0
+    token_positions = torch.arange(in_indices.shape[-1]).expand_as(in_indices)
+    return llm(in_indices, token_positions)
 
 def run_rmsnorm(
     d_model: int,
