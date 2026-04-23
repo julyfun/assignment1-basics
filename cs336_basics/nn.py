@@ -1,7 +1,9 @@
 import torch
 from torch import nn, Tensor
 from jaxtyping import Float, Bool
+from collections.abc import Callable
 from typing_extensions import override
+from einops import rearrange
 
 class Linear(nn.Module):
     def __init__(
@@ -121,7 +123,53 @@ def scaled_dot_product_attention(
     d_k = q.shape[-1]
     attn = q @ k.mT / d_k ** 0.5 # [b, ..., q_len, k_len]
     if mask is not None:
+        mask = mask.expand_as(attn)
         attn[~mask] -= float('inf')
     # v: k_len, d_v
     return softmax(attn, dim=-1) @ v
     
+class MultiheadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        # Wq | in : d_model out: h * dk
+        #      x: 1 2 3
+        # 000    @  head1
+        # 000    @
+        # ---
+        # 000    @  head2
+        # 000    @
+        self.Wq = Linear(d_model, d_model)
+        self.Wk = Linear(d_model, d_model)
+        self.Wv = Linear(d_model, d_model)
+        self.Wo = Linear(d_model, d_model)
+        
+    def forward(
+        self,
+        x: Float[Tensor, "b ... seq_len d_model"],
+        token_positions: Tensor | None,
+        rope: RotaryPositionalEmbedding | None
+    ):
+        seq_len = x.shape[-2]
+        mask = ~torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+        mask = mask[(None,) * (x.dim() + 1 - mask.dim()) + (...,)]
+        
+        h = self.num_heads
+        # Wq(x): seq_len, h*dk
+        # q = self.Wq(x) if (rope is None or token_positions is None) \
+        #     else rope(self.Wq(x), token_positions)
+        q = rearrange(self.Wq(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
+        if rope is not None and token_positions is not None:
+            q = rope(q, token_positions)
+        k = rearrange(self.Wk(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
+        if rope is not None and token_positions is not None:
+            k = rope(k, token_positions)
+        v = rearrange(self.Wv(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
+        multihead = rearrange(
+            scaled_dot_product_attention(q, k, v, mask),
+            'b ... h l d_k -> b ... l (h d_k)'
+        )
+        return self.Wo(multihead)
+ 
