@@ -94,9 +94,9 @@ def run_swiglu(
     # swiglu.w3.weight.data = w3_weight
     model = nn.SwiGLU(d_model, d_ff)
     state_dict = {
-        "W1.weight": w1_weight,
-        "W2.weight": w2_weight,
-        "W3.weight": w3_weight,
+        "w1.weight": w1_weight,
+        "w2.weight": w2_weight,
+        "w3.weight": w3_weight,
     }
     model.load_state_dict(state_dict)
     return model(in_features)
@@ -156,10 +156,10 @@ def run_multihead_self_attention(
     """
     model = nn.MultiheadSelfAttention(d_model, num_heads)
     state_dict = {
-        "Wq.weight": q_proj_weight,
-        "Wk.weight": k_proj_weight,
-        "Wv.weight": v_proj_weight,
-        "Wo.weight": o_proj_weight,
+        "q_proj.weight": q_proj_weight,
+        "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight,
+        "output_proj.weight": o_proj_weight,
     }
     _ = model.load_state_dict(state_dict)
     return model(in_features, None, None)
@@ -205,10 +205,10 @@ def run_multihead_self_attention_with_rope(
     rope = nn.RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len)
     model = nn.MultiheadSelfAttention(d_model, num_heads)
     state_dict = {
-        "Wq.weight": q_proj_weight,
-        "Wk.weight": k_proj_weight,
-        "Wv.weight": v_proj_weight,
-        "Wo.weight": o_proj_weight,
+        "q_proj.weight": q_proj_weight,
+        "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight,
+        "output_proj.weight": o_proj_weight,
     }
     _ = model.load_state_dict(state_dict)
     return model(in_features, token_positions, rope)
@@ -307,7 +307,15 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    model = nn.TransformerBlock(
+        d_model,
+        num_heads,
+        d_ff,
+        theta,
+        max_seq_len,
+    )
+    _ = model.load_state_dict(weights)
+    return model(in_features, None)
 
 
 def run_transformer_lm(

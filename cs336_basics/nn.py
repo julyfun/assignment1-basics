@@ -48,13 +48,13 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.eps = eps
-        self.g = nn.Parameter(torch.ones(d_model)).to(device)
+        self.weight = nn.Parameter(torch.ones(d_model)).to(device)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
         x = x.to(torch.float32)
         rms = torch.sqrt(self.eps + 1 / self.d_model * torch.sum(torch.square(x), dim=-1, keepdim=True))
-        return (x / rms * self.g).to(in_dtype)
+        return (x / rms * self.weight).to(in_dtype)
         
 def silu(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(x)
@@ -70,14 +70,14 @@ class SwiGLU(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
-        # may use self.d_ff = max(1, int(d_model * 8 / 3 / 64 + 0.5)) * 64
-        self.d_ff = d_ff
-        self.W1 = Linear(d_model, d_ff, device, dtype)
-        self.W2 = Linear(d_ff, d_model, device, dtype)
-        self.W3 = Linear(d_model, d_ff, device, dtype)
+        self.d_ff = d_ff 
+        # if d_ff is not None else max(1, int(d_model * 8 / 3 / 64 + 0.5)) * 64
+        self.w1 = Linear(d_model, self.d_ff, device, dtype)
+        self.w2 = Linear(self.d_ff, d_model, device, dtype)
+        self.w3 = Linear(d_model, self.d_ff, device, dtype)
        
     def forward(self, x: torch.Tensor) -> Float[Tensor, "... d_model"]:
-        return self.W2(silu(self.W1(x)) * (self.W3(x)))
+        return self.w2(silu(self.w1(x)) * (self.w3(x)))
         
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(
@@ -98,12 +98,14 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
     
-    def forward(self, x: Tensor, token_positions: Tensor) -> Tensor:
+    def forward(self, x: Tensor, token_positions: Tensor | None) -> Tensor:
         """
         x: (..., seq_len, d_k), return same shape
         token_positions:  (..., seq_len) 
         """
-        ...
+        if token_positions is None:
+            seq_len = x.shape[-2]
+            token_positions = torch.arange(seq_len).expand(*x.shape[:-1])
         cos = self.cos[token_positions]
         sin = self.sin[token_positions]
         x1 = x[..., 0::2]
@@ -129,7 +131,10 @@ def scaled_dot_product_attention(
     return softmax(attn, dim=-1) @ v
     
 class MultiheadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int):
+    def __init__(self, d_model: int, num_heads: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -141,35 +146,83 @@ class MultiheadSelfAttention(nn.Module):
         # ---
         # 000    @  head2
         # 000    @
-        self.Wq = Linear(d_model, d_model)
-        self.Wk = Linear(d_model, d_model)
-        self.Wv = Linear(d_model, d_model)
-        self.Wo = Linear(d_model, d_model)
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         
     def forward(
         self,
         x: Float[Tensor, "b ... seq_len d_model"],
         token_positions: Tensor | None,
         rope: RotaryPositionalEmbedding | None
-    ):
+    ) -> Float[Tensor, "b ... seq_len d_model"]:
         seq_len = x.shape[-2]
         mask = ~torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+        # this may be not needed, but it's ok
         mask = mask[(None,) * (x.dim() + 1 - mask.dim()) + (...,)]
         
         h = self.num_heads
         # Wq(x): seq_len, h*dk
-        # q = self.Wq(x) if (rope is None or token_positions is None) \
-        #     else rope(self.Wq(x), token_positions)
-        q = rearrange(self.Wq(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
-        if rope is not None and token_positions is not None:
-            q = rope(q, token_positions)
-        k = rearrange(self.Wk(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
-        if rope is not None and token_positions is not None:
+        q = rearrange(self.q_proj(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
+        if rope is not None:
+            q = rope(q, token_positions) # can be None
+        k = rearrange(self.k_proj(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
+        if rope is not None:
             k = rope(k, token_positions)
-        v = rearrange(self.Wv(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
+        v = rearrange(self.v_proj(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
         multihead = rearrange(
             scaled_dot_product_attention(q, k, v, mask),
             'b ... h l d_k -> b ... l (h d_k)'
         )
-        return self.Wo(multihead)
+        return self.output_proj(multihead)
  
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        theta: float,
+        max_seq_len: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.attn = MultiheadSelfAttention(
+            d_model,
+            num_heads,
+            device,
+            dtype,
+        )
+        self.ln1 = RMSNorm(
+            d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.ffn = SwiGLU(
+            d_model,
+            d_ff,
+            device=device,
+            dtype=dtype,
+        )
+        self.ln2 = RMSNorm(
+            d_model,
+            device=device,
+            dtype=dtype,
+        )
+        d_k = d_model // num_heads
+        self.rope = RotaryPositionalEmbedding(
+            theta,
+            d_k,
+            max_seq_len,
+            device=device,
+        )
+        
+    def forward(
+        self,
+        x: Float[Tensor, "b ... seq_len d_model"],
+        token_positions: Tensor | None,
+    )-> Float[Tensor, "b ... seq_len d_model"]:
+        y = x + self.attn(self.ln1(x), token_positions, rope=self.rope)
+        return x + self.ffn(self.ln2(y))
