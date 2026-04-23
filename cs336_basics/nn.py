@@ -224,5 +224,5 @@ class TransformerBlock(nn.Module):
         x: Float[Tensor, "b ... seq_len d_model"],
         token_positions: Tensor | None,
     )-> Float[Tensor, "b ... seq_len d_model"]:
-        y = x + self.attn(self.ln1(x), token_positions, rope=self.rope)
-        return x + self.ffn(self.ln2(y))
+        x = x + self.attn(self.ln1(x), token_positions, rope=self.rope)
+        return x + self.ffn(self.ln2(x))

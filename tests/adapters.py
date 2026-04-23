@@ -422,7 +422,7 @@ def run_rmsnorm(
     """
     model = nn.RMSNorm(d_model, eps)
     state = {
-        "g": torch.nn.Parameter(weights),
+        "weight": weights,
     }
     model.load_state_dict(state, strict=False)
     return model(in_features)
