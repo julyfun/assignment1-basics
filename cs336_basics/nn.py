@@ -23,6 +23,9 @@ class Linear(nn.Module):
         return x @ self.weight.T
         
 class Embedding(nn.Module):
+    """
+    param: num_embeddings * embedding_dim
+    """
     def __init__(
         self,
         num_embeddings: int,
@@ -140,12 +143,12 @@ class MultiheadSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
         # Wq | in : d_model out: h * dk
-        #      x: 1 2 3
-        # 000    @  head1
-        # 000    @
-        # ---
-        # 000    @  head2
-        # 000    @
+        # x -> seq len
+        # |  000    @  head1 每个 head 不仅 weight 不同，输入源也完全不同
+        # k  000    @  head1
+        #    ---
+        #    000    @  head2
+        #    000    @  head2
         self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
