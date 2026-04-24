@@ -1,6 +1,6 @@
 import torch
 from torch import nn, Tensor
-from jaxtyping import Float, Bool
+from jaxtyping import Float, Bool, Int
 from collections.abc import Callable
 from typing_extensions import override
 from einops import rearrange
@@ -278,3 +278,13 @@ class TransformerLM(nn.Module):
         for block in self.layers:
             x = block(x, token_positions)
         return self.lm_head(self.ln_final(x))
+
+# exp(i - max) / sumj exp(j - max) -> 
+# (i - max) - log (sumj exp(j - max) )
+def cross_entropy_loss(
+    logits: Float[Tensor, " b vocab_size"],
+    target: Int[Tensor, " b"],
+) -> Float[Tensor, " 1"]:
+    max = logits.max(dim=-1, keepdim=True).values
+    return -(logits.gather(1, target.unsqueeze(1)) - max - (logits - max).exp().sum(dim=-1, keepdim=True).log()).mean()
+ 
