@@ -1,3 +1,10 @@
+# utils
+```console
+提取训练 npy
+
+```
+
+
 # CS336 Spring 2025 Assignment 1: Basics
 
 For a full description of the assignment, see the assignment handout at
