@@ -11,8 +11,7 @@ from torch import Tensor
 
 from cs336_basics import cs336_basics
 from .tokenizer import Tokenizer
-from cs336_basics import nn
-from cs336_basics import optim
+from cs336_basics import nn, optim, data
 
 
 def run_linear(
@@ -477,7 +476,7 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    return data.get_batch(dataset, batch_size, context_length, device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
