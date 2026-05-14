@@ -13,10 +13,10 @@ def get_batch(
     ys : list[Tensor] = []
     for _ in range(batch_size):
         st = random.randint(0, n)
-        xs.append(torch.tensor(dataset[st:st + context_length]))
-        ys.append(torch.tensor(dataset[st + 1:st + context_length + 1]))
+        xs.append(torch.tensor(dataset[st:st + context_length], dtype=torch.long))
+        ys.append(torch.tensor(dataset[st + 1:st + context_length + 1], dtype=torch.long))
     return torch.stack(xs).to(device), torch.stack(ys).to(device)
-    
+
 def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -31,8 +31,8 @@ def save_checkpoint(
         },
         out,
     )
-    
-    
+
+
 def load_checkpoint(
     src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
     model: torch.nn.Module,
