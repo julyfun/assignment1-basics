@@ -21,7 +21,7 @@ class Linear(nn.Module):
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.weight.T
-        
+
 class Embedding(nn.Module):
     """
     param: num_embeddings * embedding_dim
@@ -36,10 +36,10 @@ class Embedding(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim, dtype=dtype)).to(device)
         nn.init.trunc_normal_(self.weight, std=1, a=-3, b=3)
-        
+
     def forward(self, token_ids: Tensor) -> Tensor:
         return self.weight[token_ids, :]
-        
+
 class RMSNorm(nn.Module):
     def __init__(
         self,
@@ -52,17 +52,17 @@ class RMSNorm(nn.Module):
         self.d_model = d_model
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d_model)).to(device)
-        
+
     def forward(self, x: Tensor) -> Tensor:
         in_dtype = x.dtype
         x = x.to(torch.float32)
         rms = torch.sqrt(self.eps + 1 / self.d_model * torch.sum(torch.square(x), dim=-1, keepdim=True))
         return (x / rms * self.weight).to(in_dtype)
-        
+
 def silu(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(x)
-    
-        
+
+
 class SwiGLU(nn.Module):
     def __init__(
         self,
@@ -73,15 +73,15 @@ class SwiGLU(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
-        self.d_ff = d_ff 
+        self.d_ff = d_ff
         # if d_ff is not None else max(1, int(d_model * 8 / 3 / 64 + 0.5)) * 64
         self.w1 = Linear(d_model, self.d_ff, device, dtype)
         self.w2 = Linear(self.d_ff, d_model, device, dtype)
         self.w3 = Linear(d_model, self.d_ff, device, dtype)
-       
+
     def forward(self, x: Tensor) -> Float[Tensor, "... d_model"]:
         return self.w2(silu(self.w1(x)) * (self.w3(x)))
-        
+
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(
         self,
@@ -100,11 +100,11 @@ class RotaryPositionalEmbedding(nn.Module):
         sin = torch.sin(thetas)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
-    
+
     def forward(self, x: Tensor, token_positions: Tensor) -> Tensor:
         """
         x: (..., seq_len, d_k), return same shape
-        token_positions:  (..., seq_len) 
+        token_positions:  (..., seq_len)
         """
         # if token_positions is None:
         #     seq_len = x.shape[-2]
@@ -114,11 +114,11 @@ class RotaryPositionalEmbedding(nn.Module):
         x1 = x[..., 0::2]
         x2 = x[..., 1::2]
         return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).view_as(x)
- 
+
 def softmax(x: Tensor, dim: int) -> Tensor:
     e = torch.exp(x - torch.max(x, dim=dim, keepdim=True).values)
     return e / torch.sum(e, dim=dim, keepdim=True)
-    
+
 def scaled_dot_product_attention(
     q: Float[Tensor, "b ... seq_len d_k"],
     k: Float[Tensor, "b ... seq_len d_k"],
@@ -132,7 +132,7 @@ def scaled_dot_product_attention(
         attn[~mask] -= float('inf')
     # v: k_len, d_v
     return softmax(attn, dim=-1) @ v
-    
+
 class MultiheadSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int,
         device: torch.device | None = None,
@@ -153,7 +153,7 @@ class MultiheadSelfAttention(nn.Module):
         self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        
+
     def forward(
         self,
         x: Float[Tensor, "b ... seq_len d_model"],
@@ -164,7 +164,7 @@ class MultiheadSelfAttention(nn.Module):
         mask = ~torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
         # this may be not needed, but it's ok
         mask = mask[(None,) * (x.dim() + 1 - mask.dim()) + (...,)]
-        
+
         h = self.num_heads
         # Wq(x): seq_len, h*dk
         q = rearrange(self.q_proj(x), 'b ... l (h d_k) -> b ... h l d_k', h=h)
@@ -179,7 +179,7 @@ class MultiheadSelfAttention(nn.Module):
             'b ... h l d_k -> b ... l (h d_k)'
         )
         return self.output_proj(multihead)
- 
+
 class TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -221,7 +221,7 @@ class TransformerBlock(nn.Module):
             max_seq_len,
             device=device,
         )
-        
+
     def forward(
         self,
         x: Float[Tensor, "b ... seq_len d_model"],
@@ -268,7 +268,7 @@ class TransformerLM(nn.Module):
             in_features=d_model,
             out_features=vocab_size,
         )
-        
+
     def forward(
         self,
         x: Tensor,
@@ -279,7 +279,7 @@ class TransformerLM(nn.Module):
             x = block(x, token_positions)
         return self.lm_head(self.ln_final(x))
 
-# exp(i - max) / sumj exp(j - max) -> 
+# exp(i - max) / sumj exp(j - max) ->
 # (i - max) - log (sumj exp(j - max) )
 def cross_entropy_loss(
     logits: Float[Tensor, " b vocab_size"],
@@ -287,4 +287,3 @@ def cross_entropy_loss(
 ) -> Float[Tensor, " 1"]:
     max = logits.max(dim=-1, keepdim=True).values
     return -(logits.gather(1, target.unsqueeze(1)) - max - (logits - max).exp().sum(dim=-1, keepdim=True).log()).mean()
- 
