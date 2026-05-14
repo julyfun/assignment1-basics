@@ -1,4 +1,5 @@
 import argparse
+import wandb
 from cs336_basics.train import train
 
 parser = argparse.ArgumentParser()
@@ -16,6 +17,8 @@ _ = parser.add_argument("--vocab_size", type=int, required=True)
 _ = parser.add_argument("--load_ckpt_path", type=str, default=None)
 _ = parser.add_argument("--save_ckpt_path", type=str, default=None)
 _ = parser.add_argument("--lr", type=float, default=1e-3)
+
+_ = wandb.init(project="cs336", name="1")
 
 args = parser.parse_args()
 train(**vars(args))

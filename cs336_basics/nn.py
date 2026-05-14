@@ -111,6 +111,10 @@ class RotaryPositionalEmbedding(nn.Module):
         #     token_positions = torch.arange(seq_len).expand(*x.shape[:-1])
         cos = self.cos[token_positions]
         sin = self.sin[token_positions]
+        # x may be (batch, heads, seq, d_k) while cos is (batch, seq, d_k//2): insert leading
+        for _ in range(x.dim() - cos.dim()):
+            cos = cos.unsqueeze(-3)
+            sin = sin.unsqueeze(-3)
         x1 = x[..., 0::2]
         x2 = x[..., 1::2]
         return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).view_as(x)
@@ -282,8 +286,8 @@ class TransformerLM(nn.Module):
 # exp(i - max) / sumj exp(j - max) ->
 # (i - max) - log (sumj exp(j - max) )
 def cross_entropy_loss(
-    logits: Float[Tensor, " b vocab_size"],
-    target: Int[Tensor, " b"],
+    logits: Float[Tensor, " b ... vocab_size"],
+    target: Int[Tensor, " b ..."],
 ) -> Float[Tensor, " 1"]:
     max = logits.max(dim=-1, keepdim=True).values
-    return -(logits.gather(1, target.unsqueeze(1)) - max - (logits - max).exp().sum(dim=-1, keepdim=True).log()).mean()
+    return -(logits.gather(-1, target.unsqueeze(1)) - max - (logits - max).exp().sum(dim=-1, keepdim=True).log()).mean()

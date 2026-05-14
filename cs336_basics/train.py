@@ -53,6 +53,7 @@ def train(
     log_steps = 0
     pbar = tqdm(range(iteration, target_iteration))
     for epoch in pbar:
+        # Train
         model.train()
         log_train_losses = []
         x, y = data.get_batch(
@@ -72,6 +73,7 @@ def train(
         log_steps += 1
         log_train_losses.append(loss.item()) # item(): convert the tensor to a scalar (on cpu)
 
+        # Eval
         model.eval()
         log_eval_losses = []
         x, y = data.get_batch(
@@ -81,11 +83,14 @@ def train(
             device,
         )
         opt.zero_grad()
-        logits = model(x)
+        bs, seq_len = x.shape
+        token_positions = torch.arange(seq_len, device=device, dtype=torch.long).expand(bs, seq_len)
+        logits = model(x, token_positions)
         loss = nn.cross_entropy_loss(logits, y)
         loss.backward()
         opt.step()
 
+        # Log
         log_eval_losses.append(loss.item())
 
         log_trn = sum(log_train_losses) / len(log_train_losses)
