@@ -56,6 +56,12 @@ class Tokenizer:
         
     def encode(self, text: str) -> list[int]:
         return self._inner.encode(text)
+
+    def encode_file(self, path: str) -> list[int]:
+        return self._inner.encode_file(path)
+
+    def encode_file_u16(self, path: str) -> list[int]:
+        return self._inner.encode_file_u16(path)
         
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         carry = ""

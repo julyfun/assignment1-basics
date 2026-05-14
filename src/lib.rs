@@ -186,6 +186,18 @@ mod cs336_basics {
                 .map_err(|e| PyValueError::new_err(e.to_string()))
         }
 
+        fn encode_file(&self, path: &str) -> PyResult<Vec<u64>> {
+            self.inner
+                .encode_file(path)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        }
+
+        fn encode_file_u16(&self, path: &str) -> PyResult<Vec<u16>> {
+            self.inner
+                .encode_file_u16(path)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        }
+
         fn decode(&self, ids: Vec<u64>) -> PyResult<String> {
             self.inner
                 .decode(ids.as_slice())

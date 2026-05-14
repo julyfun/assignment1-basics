@@ -2,6 +2,8 @@ use super::{FixedHasher, PAT, hasher, invalid};
 use fancy_regex::Regex;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 
 #[derive(Debug, Clone)]
 struct DecodePreState {
@@ -307,6 +309,25 @@ impl TokenizerCore {
                 .ok_or_else(|| invalid("special token missing in vocab".to_string()))?;
             out.push(id);
             i = pos + st.len();
+        }
+        Ok(out)
+    }
+
+    pub fn encode_file(&self, path: &str) -> Result<Vec<u64>, std::io::Error> {
+        let mut file = File::open(path)?;
+        let mut text = String::new();
+        let _ = file.read_to_string(&mut text)?;
+        self.encode(text.as_str())
+    }
+
+    pub fn encode_file_u16(&self, path: &str) -> Result<Vec<u16>, std::io::Error> {
+        let ids = self.encode_file(path)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if id > u16::MAX as u64 {
+                return Err(invalid(format!("token id {} exceeds uint16 range", id)));
+            }
+            out.push(id as u16);
         }
         Ok(out)
     }
